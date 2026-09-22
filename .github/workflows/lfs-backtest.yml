@@ -32,14 +32,16 @@ jobs:
       - run: pip install -r backtest/requirements.txt
       - run: python -m py_compile backtest/core.py backtest/kr_point_in_time.py
       - run: pytest -q backtest/test_core.py
-      - name: KRX historical connectivity smoke
+      - name: Marcap historical-universe smoke
         run: |
           python - <<'PY'
-          from pykrx import stock
-          df = stock.get_market_cap_by_ticker("20240603", market="KOSPI")
+          from datetime import date
+          from backtest.kr_point_in_time import MarcapStore
+          store = MarcapStore()
+          d, df = store.snapshot_on_or_after(date(2024, 6, 1))
           if df is None or df.empty:
-              raise SystemExit("KRX historical market-cap data is empty")
-          print("KRX rows:", len(df))
+              raise SystemExit("Marcap historical market-cap data is empty")
+          print("Marcap date:", d, "rows:", len(df))
           PY
 
   smoke:
