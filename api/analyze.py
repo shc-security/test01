@@ -480,6 +480,8 @@ def _dart_interim_ttm(
     reprt_code,
     fs_div,
     major_rows=None,
+    prior_rows=None,
+    prior_major_rows=None,
 ):
     if not annual_latest or annual_latest.get("year") != year - 1:
         return None
@@ -488,49 +490,68 @@ def _dart_interim_ttm(
 
     if reprt_code in ("11012", "11014"):
         current_income_key = "thstrm_add_amount"
-        prior_income_key = "frmtrm_add_amount"
     else:
         current_income_key = "thstrm_amount"
-        prior_income_key = "frmtrm_amount"
 
-    # OpenDART full statements use cumulative CF values for interim reports.
-    # Current CF is normally thstrm_amount; prior-year comparable cumulative
-    # CF is normally frmtrm_add_amount. Fall back only when a field is absent.
-    current_cash_key = "thstrm_amount"
-    prior_cash_key = "frmtrm_add_amount"
-    if rows:
-        cf_rows = [r for r in rows if r.get("sj_div") == "CF"]
-        if not any(_jnum(r.get(current_cash_key)) is not None for r in cf_rows):
-            current_cash_key = "thstrm_add_amount"
-        if not any(_jnum(r.get(prior_cash_key)) is not None for r in cf_rows):
-            prior_cash_key = "frmtrm_amount"
-
+    # Current interim: use current YTD directly.
     current_ytd = (
         _dart_metrics_from_rows(
             rows,
             income_key=current_income_key,
-            cash_key=current_cash_key,
+            cash_key="thstrm_amount",
             balance_key="thstrm_amount",
         )
         if rows else {}
     )
-    prior_ytd = (
-        _dart_metrics_from_rows(
-            rows,
-            income_key=prior_income_key,
-            cash_key=prior_cash_key,
-            balance_key="frmtrm_amount",
-        )
-        if rows else {}
-    )
-
-    # The compact major-account endpoint is much less ambiguous for
-    # revenue / operating profit / net income.
     if major_rows:
-        current_major = _major_metrics_from_rows(major_rows, current_income_key)
-        prior_major = _major_metrics_from_rows(major_rows, prior_income_key)
-        current_ytd = _merge_metrics(current_ytd, current_major)
-        prior_ytd = _merge_metrics(prior_ytd, prior_major)
+        current_ytd = _merge_metrics(
+            current_ytd,
+            _major_metrics_from_rows(major_rows, current_income_key),
+        )
+
+    # Prior-year comparable interim: prefer a direct OpenDART request for the
+    # prior year's same report. This is more reliable than comparative columns
+    # whose field layout differs across IS/CF and issuers.
+    if prior_rows or prior_major_rows:
+        prior_ytd = (
+            _dart_metrics_from_rows(
+                prior_rows,
+                income_key=current_income_key,
+                cash_key="thstrm_amount",
+                balance_key="thstrm_amount",
+            )
+            if prior_rows else {}
+        )
+        if prior_major_rows:
+            prior_ytd = _merge_metrics(
+                prior_ytd,
+                _major_metrics_from_rows(prior_major_rows, current_income_key),
+            )
+    else:
+        # Last-resort comparative-column fallback.
+        prior_income_key = (
+            "frmtrm_add_amount" if reprt_code in ("11012", "11014")
+            else "frmtrm_amount"
+        )
+        prior_cash_key = "frmtrm_add_amount"
+        if rows:
+            cf_rows = [r for r in rows if r.get("sj_div") == "CF"]
+            if not any(_jnum(r.get(prior_cash_key)) is not None for r in cf_rows):
+                prior_cash_key = "frmtrm_amount"
+        prior_ytd = (
+            _dart_metrics_from_rows(
+                rows,
+                income_key=prior_income_key,
+                cash_key=prior_cash_key,
+                balance_key="frmtrm_amount",
+            )
+            if rows else {}
+        )
+        if major_rows:
+            prior_ytd = _merge_metrics(
+                prior_ytd,
+                _major_metrics_from_rows(major_rows, prior_income_key),
+            )
 
     required = ("revenue", "operating_income", "net_income")
     if any(current_ytd.get(k) is None or prior_ytd.get(k) is None for k in required):
@@ -553,13 +574,14 @@ def _dart_interim_ttm(
         out[k] = current_ytd.get(k) if current_ytd.get(k) is not None else annual_latest.get(k)
 
     label = {"11013": "Q1", "11012": "H1", "11014": "Q3"}.get(reprt_code, reprt_code)
-    out["basis"] = f"TTM {year} {label} · FY{annual_latest['year']} bridge"
+    out["basis"] = f"TTM {year} {label} · direct OpenDART bridge"
     out["report_code"] = reprt_code
     out["ttm_bridge"] = {
         "annual_year": annual_latest.get("year"),
         "annual": {k: annual_latest.get(k) for k in flow_fields},
         "current_ytd": {k: current_ytd.get(k) for k in flow_fields},
         "prior_ytd": {k: prior_ytd.get(k) for k in flow_fields},
+        "prior_interim_direct": bool(prior_rows or prior_major_rows),
     }
     return out
 
@@ -664,6 +686,197 @@ def _kr_price(stock_code):
             return found[0]
     return None
 
+
+
+YAHOO_FUNDAMENTALS = "https://query1.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/{}"
+
+
+def _yahoo_fundamentals_raw(symbol):
+    now_ts = int(datetime.utcnow().timestamp()) + 86400
+    start_ts = int(datetime(2017, 1, 1).timestamp())
+    fields = (
+        "annualTotalRevenue",
+        "annualOperatingIncome",
+        "annualNetIncome",
+        "annualTotalAssets",
+        "annualStockholdersEquity",
+        "annualCashAndCashEquivalents",
+        "annualCashCashEquivalentsAndShortTermInvestments",
+        "annualTotalDebt",
+        "annualOperatingCashFlow",
+        "annualCapitalExpenditure",
+        "annualOrdinarySharesNumber",
+        "trailingTotalRevenue",
+        "trailingOperatingIncome",
+        "trailingNetIncome",
+        "trailingOperatingCashFlow",
+        "trailingCapitalExpenditure",
+        "quarterlyTotalAssets",
+        "quarterlyStockholdersEquity",
+        "quarterlyCashAndCashEquivalents",
+        "quarterlyCashCashEquivalentsAndShortTermInvestments",
+        "quarterlyTotalDebt",
+        "quarterlyOrdinarySharesNumber",
+    )
+    params = {
+        "symbol": symbol,
+        "type": ",".join(fields),
+        "period1": start_ts,
+        "period2": now_ts,
+    }
+    last_error = None
+    for host in (
+        YAHOO_FUNDAMENTALS.format(symbol),
+        YAHOO_FUNDAMENTALS.format(symbol).replace("query1.", "query2."),
+    ):
+        try:
+            r = _http_get(
+                host,
+                params=params,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; lattice-stock-analyzer/1.0)"},
+                timeout=(3, 9),
+            )
+            data = r.json()
+            if data.get("timeseries", {}).get("result"):
+                return data
+        except Exception as e:
+            last_error = e
+    raise RuntimeError(f"Yahoo 재무 시계열 조회 실패: {last_error}")
+
+
+def _yahoo_ts_map(data):
+    out = {}
+    for block in data.get("timeseries", {}).get("result", []) or []:
+        meta_types = block.get("meta", {}).get("type") or []
+        typ = meta_types[0] if meta_types else None
+        if not typ:
+            for k in block.keys():
+                if k.startswith(("annual", "quarterly", "trailing")):
+                    typ = k
+                    break
+        if not typ:
+            continue
+        vals = []
+        for item in block.get(typ, []) or []:
+            raw = _jnum((item.get("reportedValue") or {}).get("raw"))
+            date = item.get("asOfDate")
+            if raw is not None and date:
+                vals.append({"date": date, "value": raw})
+        vals.sort(key=lambda x: x["date"])
+        if vals:
+            out[typ] = vals
+    return out
+
+
+def _yahoo_latest(ts, keys):
+    for k in keys:
+        vals = ts.get(k) or []
+        if vals:
+            return vals[-1]["value"]
+    return None
+
+
+def _yahoo_annual_rows(symbol):
+    data = _yahoo_fundamentals_raw(symbol)
+    ts = _yahoo_ts_map(data)
+
+    keymap = {
+        "revenue": ("annualTotalRevenue",),
+        "operating_income": ("annualOperatingIncome",),
+        "net_income": ("annualNetIncome",),
+        "assets": ("annualTotalAssets",),
+        "equity": ("annualStockholdersEquity",),
+        "cash": (
+            "annualCashAndCashEquivalents",
+            "annualCashCashEquivalentsAndShortTermInvestments",
+        ),
+        "debt": ("annualTotalDebt",),
+        "cfo": ("annualOperatingCashFlow",),
+        "capex": ("annualCapitalExpenditure",),
+    }
+
+    by_year = {}
+    for metric, keys in keymap.items():
+        chosen = None
+        for key in keys:
+            if ts.get(key):
+                chosen = ts[key]
+                break
+        for item in chosen or []:
+            try:
+                year = int(item["date"][:4])
+            except Exception:
+                continue
+            by_year.setdefault(year, {"year": year})[metric] = (
+                abs(item["value"]) if metric == "capex" else item["value"]
+            )
+
+    rows = [
+        row for year, row in sorted(by_year.items())
+        if row.get("revenue") is not None and row.get("operating_income") is not None
+    ][-6:]
+
+    latest_annual = rows[-1] if rows else None
+
+    current = None
+    trailing_map = {
+        "revenue": ("trailingTotalRevenue",),
+        "operating_income": ("trailingOperatingIncome",),
+        "net_income": ("trailingNetIncome",),
+        "cfo": ("trailingOperatingCashFlow",),
+        "capex": ("trailingCapitalExpenditure",),
+    }
+    if latest_annual:
+        current = {"year": datetime.utcnow().year, "is_ttm": True, "basis": "최근 12개월 · Yahoo fallback"}
+        for metric, keys in trailing_map.items():
+            v = _yahoo_latest(ts, keys)
+            current[metric] = abs(v) if metric == "capex" and v is not None else v
+        current["assets"] = _yahoo_latest(ts, ("quarterlyTotalAssets",)) or latest_annual.get("assets")
+        current["equity"] = _yahoo_latest(ts, ("quarterlyStockholdersEquity",)) or latest_annual.get("equity")
+        current["cash"] = _yahoo_latest(
+            ts,
+            ("quarterlyCashAndCashEquivalents", "quarterlyCashCashEquivalentsAndShortTermInvestments"),
+        ) or latest_annual.get("cash")
+        current["debt"] = _yahoo_latest(ts, ("quarterlyTotalDebt",)) or latest_annual.get("debt")
+
+        # If Yahoo has no trailing series for some issuer, sum the latest four
+        # quarterly observations when available.
+        qmap = {
+            "revenue": "quarterlyTotalRevenue",
+            "operating_income": "quarterlyOperatingIncome",
+            "net_income": "quarterlyNetIncome",
+            "cfo": "quarterlyOperatingCashFlow",
+            "capex": "quarterlyCapitalExpenditure",
+        }
+        missing = [k for k in qmap if current.get(k) is None]
+        if missing:
+            # Query only if needed, keeping the main request shorter for most symbols.
+            q_fields = ",".join(qmap.values())
+            now_ts = int(datetime.utcnow().timestamp()) + 86400
+            start_ts = int(datetime(2024, 1, 1).timestamp())
+            try:
+                qdata = _http_get(
+                    YAHOO_FUNDAMENTALS.format(symbol),
+                    params={"symbol": symbol, "type": q_fields, "period1": start_ts, "period2": now_ts},
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; lattice-stock-analyzer/1.0)"},
+                    timeout=(3, 8),
+                ).json()
+                qts = _yahoo_ts_map(qdata)
+                for metric, key in qmap.items():
+                    if current.get(metric) is not None:
+                        continue
+                    vals = qts.get(key) or []
+                    if len(vals) >= 4:
+                        total = sum(x["value"] for x in vals[-4:])
+                        current[metric] = abs(total) if metric == "capex" else total
+            except Exception:
+                pass
+
+    shares = _yahoo_latest(
+        ts,
+        ("quarterlyOrdinarySharesNumber", "annualOrdinarySharesNumber"),
+    )
+    return rows, current, shares
 
 def _sec_headers():
     ua = os.getenv("SEC_USER_AGENT", "").strip() or "lattice-stock-analyzer/1.0"
@@ -1509,7 +1722,7 @@ def _compute_lfs(series, tax_rate, price=None, shares=None, current=None, indust
         "history": clean,
         "current_data": current_row,
         "methodology": {
-            "version": "pilot-0.3.5",
+            "version": "pilot-0.3.6",
             "main_score": "40% current + 60% normalized; quality-only rescaled when valuation data is unavailable",
             "industry_percentile_method": "sector-adjusted parametric benchmark; not yet a live peer cross-section",
             "note": "TTM이 가능하면 현재점수는 TTM을 사용하고, 정상화점수는 최근 연간 분포의 중앙값/지속성을 사용합니다. 업종 percentile은 무료 즉시조회 버전의 섹터 benchmark CDF입니다.",
@@ -1550,6 +1763,14 @@ def analyze_kr(q):
             ex.submit(_dart_major_rows, company["corp_code"], interim_year, interim_code)
             if interim_code else None
         )
+        prior_interim_full_job = (
+            ex.submit(_dart_statement_rows, company["corp_code"], interim_year - 1, interim_code)
+            if interim_code else None
+        )
+        prior_interim_major_job = (
+            ex.submit(_dart_major_rows, company["corp_code"], interim_year - 1, interim_code)
+            if interim_code else None
+        )
         info_job = ex.submit(_dart_company_info, company["corp_code"])
         price_job = ex.submit(_kr_price, company["stock_code"]) if company["stock_code"] else None
 
@@ -1581,6 +1802,18 @@ def analyze_kr(q):
             )
         except Exception:
             interim_major, interim_major_fs = None, None
+        try:
+            prior_interim_rows, prior_interim_fs = (
+                prior_interim_full_job.result(timeout=18) if prior_interim_full_job else (None, None)
+            )
+        except Exception:
+            prior_interim_rows, prior_interim_fs = None, None
+        try:
+            prior_interim_major, prior_interim_major_fs = (
+                prior_interim_major_job.result(timeout=14) if prior_interim_major_job else (None, None)
+            )
+        except Exception:
+            prior_interim_major, prior_interim_major_fs = None, None
         try:
             company_info = info_job.result(timeout=10) or {}
         except Exception:
@@ -1652,6 +1885,8 @@ def analyze_kr(q):
             interim_code,
             interim_fs or interim_major_fs,
             major_rows=interim_major,
+            prior_rows=prior_interim_rows,
+            prior_major_rows=prior_interim_major,
         )
 
     # Never label an old-FY bridge as current TTM.
@@ -1722,36 +1957,56 @@ def analyze_kr(q):
 
 def analyze_us(q):
     company = _sec_company(q)
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        cf_job = ex.submit(_sec_companyfacts, company["cik"])
-        sub_job = ex.submit(_sec_submissions, company["cik"])
-        price_job = ex.submit(_yahoo_price, company["ticker"])
-        cf = cf_job.result(timeout=10)
-        try:
-            submissions = sub_job.result(timeout=7)
-        except Exception:
-            submissions = {}
-        try:
-            p = price_job.result(timeout=6)
-        except Exception:
-            p = None
+    ticker = company["ticker"]
 
-    rows = _sec_series(cf)
-    rows = [r for r in rows if r["year"] >= datetime.utcnow().year - 9][-7:]
+    # Price is independent and should still work even if SEC blocks the Vercel IP.
+    try:
+        p = _yahoo_price(ticker)
+    except Exception:
+        p = None
+
+    cf = None
+    submissions = {}
+    sec_error = None
+    try:
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            cf_job = ex.submit(_sec_companyfacts, company["cik"])
+            sub_job = ex.submit(_sec_submissions, company["cik"])
+            cf = cf_job.result(timeout=12)
+            try:
+                submissions = sub_job.result(timeout=8)
+            except Exception:
+                submissions = {}
+    except Exception as e:
+        sec_error = str(e)
+        cf = None
+
+    source_mode = "SEC EDGAR"
+    if cf:
+        rows = _sec_series(cf)
+        rows = [r for r in rows if r["year"] >= datetime.utcnow().year - 9][-7:]
+        current = _sec_ttm_row(cf, rows[-1]) if rows else None
+        shares = _sec_latest_shares(cf)
+    else:
+        # Vercel/cloud IPs can receive 403 from data.sec.gov even with a proper
+        # User-Agent. Fall back to Yahoo's public fundamentals time-series.
+        rows, current, shares = _yahoo_annual_rows(ticker)
+        source_mode = "Yahoo fundamentals fallback"
+
     if len(rows) < 2:
-        raise RuntimeError("SEC Company Facts에서 충분한 연간 재무데이터를 찾지 못했습니다.")
+        raise RuntimeError(
+            "미국 재무데이터를 충분히 가져오지 못했습니다. "
+            + (f"SEC 오류: {sec_error}" if sec_error else "")
+        )
 
-    annual_latest = rows[-1]
-    current = _sec_ttm_row(cf, annual_latest)
-    shares = _sec_latest_shares(cf)
     price = p.get("price") if p else None
 
-    sic = submissions.get("sic")
-    sector = _sector_from_sic(sic)
+    sic = submissions.get("sic") if submissions else None
+    sector = _sector_from_sic(sic) if sic else "General"
     industry = {
         "sector": sector,
         "industry_code": str(sic) if sic is not None else None,
-        "industry_name": submissions.get("sicDescription") or sector,
+        "industry_name": submissions.get("sicDescription") if submissions else sector,
     }
 
     result = _compute_lfs(
@@ -1766,11 +2021,17 @@ def analyze_us(q):
         {
             "market": "US",
             "company": company["title"],
-            "ticker": company["ticker"],
+            "ticker": ticker,
             "cik": company["cik"],
             "price": p,
             "shares_approx": shares,
-            "sources": ["SEC EDGAR Company Facts", "SEC submissions", "Yahoo Finance chart endpoint (price fallback)"],
+            "us_data_source": source_mode,
+            "sec_fallback_reason": sec_error if source_mode != "SEC EDGAR" else None,
+            "sources": (
+                ["SEC EDGAR Company Facts", "SEC submissions", "Yahoo Finance price"]
+                if source_mode == "SEC EDGAR"
+                else ["Yahoo Finance fundamentals time-series", "Yahoo Finance price"]
+            ),
         }
     )
     return result
