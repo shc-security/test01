@@ -164,112 +164,153 @@ def _dart_json(endpoint, params):
     data = _http_get(
         f"{DART_BASE}/{endpoint}",
         params=p,
-        timeout=(2, 5),
+        timeout=(1.5, 3.5),
     ).json()
     if data.get("status") not in (None, "000"):
         return None
     return data
 
 
-def _dart_annual_rows(corp_code, year):
-    for fs_div in ("CFS", "OFS"):
+def _dart_statement_rows(corp_code, year, reprt_code):
+    def fetch_one(fs_div):
         try:
             data = _dart_json(
                 "fnlttSinglAcntAll.json",
                 {
                     "corp_code": corp_code,
                     "bsns_year": str(year),
-                    "reprt_code": "11011",
+                    "reprt_code": reprt_code,
                     "fs_div": fs_div,
                 },
             )
+            if data and data.get("list"):
+                return fs_div, data["list"]
         except Exception:
-            data = None
-        if data and data.get("list"):
-            return data["list"], fs_div
+            pass
+        return fs_div, None
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        jobs = [ex.submit(fetch_one, "CFS"), ex.submit(fetch_one, "OFS")]
+        for future in as_completed(jobs):
+            fs_div, rows = future.result()
+            if rows:
+                results[fs_div] = rows
+
+    if results.get("CFS"):
+        return results["CFS"], "CFS"
+    if results.get("OFS"):
+        return results["OFS"], "OFS"
     return None, None
 
 
+def _dart_annual_rows(corp_code, year):
+    return _dart_statement_rows(corp_code, year, "11011")
+
+
+def _dart_company_info(corp_code):
+    try:
+        return _dart_json("company.json", {"corp_code": corp_code}) or {}
+    except Exception:
+        return {}
+
+
+def _sj_match(value, sj):
+    if not sj:
+        return True
+    if isinstance(sj, (tuple, list, set)):
+        return value in sj
+    return value == sj
+
+
 def _row_value(rows, ids=(), names=(), sj=None, amount_key="thstrm_amount"):
-    # Prefer standardized account ids.
     for aid in ids:
         for r in rows:
-            if sj and r.get("sj_div") != sj:
+            if not _sj_match(r.get("sj_div"), sj):
                 continue
             if (r.get("account_id") or "") == aid:
                 v = _jnum(r.get(amount_key))
                 if v is not None:
                     return v
 
-    names_l = [n.lower() for n in names]
+    names_l = [n.lower().replace(" ", "") for n in names]
     for r in rows:
-        if sj and r.get("sj_div") != sj:
+        if not _sj_match(r.get("sj_div"), sj):
             continue
         nm = (r.get("account_nm") or "").lower().replace(" ", "")
         for n in names_l:
-            if n.replace(" ", "") in nm:
+            if n in nm:
                 v = _jnum(r.get(amount_key))
                 if v is not None:
                     return v
     return None
 
 
-def _dart_metrics_from_rows(rows, amount_key="thstrm_amount"):
+def _first_existing_amount_key(rows, candidates):
+    for key in candidates:
+        for r in rows:
+            if _jnum(r.get(key)) is not None:
+                return key
+    return candidates[-1]
+
+
+def _dart_metrics_from_rows(rows, flow_key="thstrm_amount", balance_key="thstrm_amount"):
+    income_sj = ("IS", "CIS")
     revenue = _row_value(
         rows,
         ids=("ifrs-full_Revenue", "ifrs-full_RevenueFromContractsWithCustomers"),
-        names=("매출액", "영업수익", "수익(매출액)"),
-        sj="IS",
-        amount_key=amount_key,
+        names=("매출액", "영업수익", "수익(매출액)", "수익"),
+        sj=income_sj,
+        amount_key=flow_key,
     )
     op_income = _row_value(
         rows,
         ids=("dart_OperatingIncomeLoss",),
-        names=("영업이익", "영업이익(손실)"),
-        sj="IS",
-        amount_key=amount_key,
+        names=("영업이익", "영업이익(손실)", "영업손익"),
+        sj=income_sj,
+        amount_key=flow_key,
     )
     net_income = _row_value(
         rows,
         ids=("ifrs-full_ProfitLoss",),
-        names=("당기순이익", "당기순이익(손실)", "연결당기순이익"),
-        sj="IS",
-        amount_key=amount_key,
+        names=("당기순이익", "당기순이익(손실)", "연결당기순이익", "분기순이익", "반기순이익"),
+        sj=income_sj,
+        amount_key=flow_key,
     )
     assets = _row_value(
         rows,
         ids=("ifrs-full_Assets",),
         names=("자산총계",),
         sj="BS",
-        amount_key=amount_key,
+        amount_key=balance_key,
     )
     equity = _row_value(
         rows,
         ids=("ifrs-full_Equity",),
         names=("자본총계",),
         sj="BS",
-        amount_key=amount_key,
+        amount_key=balance_key,
     )
     cash = _row_value(
         rows,
         ids=("ifrs-full_CashAndCashEquivalents",),
         names=("현금및현금성자산",),
         sj="BS",
-        amount_key=amount_key,
+        amount_key=balance_key,
     )
     cfo = _row_value(
         rows,
         ids=("ifrs-full_CashFlowsFromUsedInOperatingActivities",),
         names=("영업활동현금흐름", "영업활동으로인한현금흐름"),
         sj="CF",
-        amount_key=amount_key,
+        amount_key=flow_key,
     )
     capex = _row_value(
         rows,
         ids=("ifrs-full_PurchaseOfPropertyPlantAndEquipment",),
-        names=("유형자산의취득", "유형자산 취득"),
+        names=("유형자산의취득", "유형자산 취득", "유형자산취득"),
         sj="CF",
-        amount_key=amount_key,
+        amount_key=flow_key,
     )
     if capex is not None:
         capex = abs(capex)
@@ -287,7 +328,7 @@ def _dart_metrics_from_rows(rows, amount_key="thstrm_amount"):
     for r in rows:
         aid = r.get("account_id") or ""
         if r.get("sj_div") == "BS" and aid in debt_ids and aid not in seen_ids:
-            v = _jnum(r.get(amount_key))
+            v = _jnum(r.get(balance_key))
             if v is not None:
                 debt_vals.append(v)
                 seen_ids.add(aid)
@@ -306,10 +347,44 @@ def _dart_metrics_from_rows(rows, amount_key="thstrm_amount"):
     }
 
 
-def _dart_share_count(corp_code, year):
+def _dart_interim_ttm(annual_latest, rows, year, reprt_code, fs_div):
+    if not rows or not annual_latest:
+        return None
+
+    if reprt_code in ("11012", "11014"):
+        cur_flow_key = _first_existing_amount_key(rows, ("thstrm_add_amount", "thstrm_amount"))
+        prev_flow_key = _first_existing_amount_key(rows, ("frmtrm_add_amount", "frmtrm_amount"))
+    else:
+        cur_flow_key = "thstrm_amount"
+        prev_flow_key = "frmtrm_amount"
+
+    current_ytd = _dart_metrics_from_rows(rows, flow_key=cur_flow_key, balance_key="thstrm_amount")
+    prior_ytd = _dart_metrics_from_rows(rows, flow_key=prev_flow_key, balance_key="frmtrm_amount")
+
+    flow_fields = ("revenue", "operating_income", "net_income", "cfo", "capex")
+    if current_ytd.get("revenue") is None or prior_ytd.get("revenue") is None:
+        return None
+
+    out = {"year": year, "is_ttm": True, "fs_div": fs_div}
+    for k in flow_fields:
+        a = annual_latest.get(k)
+        cy = current_ytd.get(k)
+        py = prior_ytd.get(k)
+        out[k] = (a + cy - py) if a is not None and cy is not None and py is not None else a
+
+    for k in ("assets", "equity", "cash", "debt"):
+        out[k] = current_ytd.get(k) if current_ytd.get(k) is not None else annual_latest.get(k)
+
+    label = {"11013": "Q1", "11012": "H1", "11014": "Q3"}.get(reprt_code, reprt_code)
+    out["basis"] = f"TTM {year} {label}"
+    out["report_code"] = reprt_code
+    return out
+
+
+def _dart_share_count(corp_code, year, reprt_code="11011"):
     data = _dart_json(
         "stockTotqySttus.json",
-        {"corp_code": corp_code, "bsns_year": str(year), "reprt_code": "11011"},
+        {"corp_code": corp_code, "bsns_year": str(year), "reprt_code": reprt_code},
     )
     if not data or not data.get("list"):
         return None
@@ -344,10 +419,20 @@ def _yahoo_price(symbol):
 
 
 def _kr_price(stock_code):
-    for suffix in (".KS", ".KQ"):
-        p = _yahoo_price(stock_code + suffix)
-        if p and p.get("price"):
-            return p
+    symbols = (stock_code + ".KS", stock_code + ".KQ")
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        jobs = {ex.submit(_yahoo_price, s): s for s in symbols}
+        found = []
+        for future in as_completed(jobs):
+            try:
+                p = future.result()
+            except Exception:
+                p = None
+            if p and p.get("price"):
+                found.append(p)
+        if found:
+            found.sort(key=lambda x: 0 if str(x.get("symbol", "")).endswith(".KS") else 1)
+            return found[0]
     return None
 
 
