@@ -36,6 +36,12 @@
     th,td { text-align:left; border-bottom:1px solid #e5e7eb; padding:10px 6px; vertical-align:top; }
     th { color:#4b5563; font-size:12px; }
     td.explain { color:#6b7280; font-size:12px; line-height:1.45; }
+    details { background:#f9fafb; border-radius:12px; padding:12px 14px; }
+    summary { cursor:pointer; font-weight:700; }
+    .raw-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:8px; margin-top:12px; }
+    .raw { background:white; border-radius:10px; padding:11px; }
+    .raw span { color:#6b7280; font-size:12px; display:block; }
+    .raw b { display:block; margin-top:3px; }
     .err { color:#b91c1c; white-space:pre-wrap; }
     .hidden { display:none; }
     @media (max-width:700px) {
@@ -43,6 +49,7 @@
       .row { grid-template-columns:1fr; }
       .summary-grid { grid-template-columns:1fr; }
       .indicator { grid-template-columns:1fr; gap:5px; }
+      .raw-grid { grid-template-columns:1fr; }
       .score-note { max-width:none; }
       table { font-size:12px; }
     }
@@ -119,6 +126,17 @@
         <tbody id="components"></tbody>
       </table>
     </div>
+
+    <div class="card">
+      <details>
+        <summary>상세 재무 원자료 보기</summary>
+        <div class="muted" style="margin-top:10px">
+          “최근 12개월”은 가장 최근 공시까지 이어 붙인 직전 1년 실적입니다.
+          현금흐름 데이터가 공시 구조상 확인되지 않으면 해당 항목은 “자료 부족”으로 표시합니다.
+        </div>
+        <div class="raw-grid" id="rawData"></div>
+      </details>
+    </div>
   </div>
 
   <div id="error" class="card err hidden"></div>
@@ -148,6 +166,17 @@ function addIndicator(root, label, value, help) {
     '<div class="label">' + label + '</div>' +
     '<div class="value">' + value + '</div>' +
     '<div class="help">' + help + '</div>';
+  root.appendChild(d);
+}
+function money(v, market) {
+  if (v === null || v === undefined) return "자료 부족";
+  if (market === "KR") return (v / 1e12).toFixed(1) + "조원";
+  return "$" + (v / 1e9).toFixed(1) + "B";
+}
+function addRaw(root, label, value) {
+  var d = document.createElement("div");
+  d.className = "raw";
+  d.innerHTML = '<span>' + label + '</span><b>' + value + '</b>';
   root.appendChild(d);
 }
 
@@ -296,6 +325,15 @@ document.getElementById("go").onclick = async function() {
       "<td><b>" + (d.normalized_valuation_score == null ? "계산 불가" : d.normalized_valuation_score.toFixed(1) + " / 15") + "</b></td>" +
       '<td class="explain">현재 주가가 이익과 잉여현금흐름에 비해 얼마나 비싼지 또는 싼지 평가합니다.</td>';
     tbody.appendChild(trv);
+
+    var raw = document.getElementById("rawData");
+    raw.innerHTML = "";
+    addRaw(raw, "최근 12개월 매출", money(d.metrics.current_revenue, d.market));
+    addRaw(raw, "최근 12개월 영업이익", money(d.metrics.current_operating_income, d.market));
+    addRaw(raw, "최근 12개월 순이익", money(d.metrics.current_net_income, d.market));
+    addRaw(raw, "최근 12개월 영업현금흐름", money(d.metrics.current_cfo, d.market));
+    addRaw(raw, "최근 12개월 설비투자", money(d.metrics.current_capex, d.market));
+    addRaw(raw, "최근 12개월 잉여현금흐름", money(d.metrics.current_fcf, d.market));
 
     result.classList.remove("hidden");
     status.textContent = "완료 · 최신 공시 기준";
