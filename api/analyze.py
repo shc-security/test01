@@ -17,6 +17,7 @@ DART_BASE = "https://opendart.fss.or.kr/api"
 SEC_BASE = "https://data.sec.gov"
 SEC_TICKERS = "https://www.sec.gov/files/company_tickers.json"
 YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{}"
+DART_CORP_CACHE_URL = "https://raw.githubusercontent.com/jinhoo-choi/risk-news-crolling/main/dart_corp_codes.json"
 
 _DART_CORPS = None
 _SEC_TICKER_MAP = None
@@ -85,7 +86,36 @@ def _load_dart_corps():
     if _DART_CORPS is not None:
         return _DART_CORPS
 
-    r = _http_get(f"{DART_BASE}/corpCode.xml", params={"crtfc_key": _dart_key()})
+    # 빠른 경로: 상장사 stock_code -> DART corp_code 공개 캐시.
+    # 재무 숫자는 이 파일을 쓰지 않고, 식별자 해석에만 사용한다.
+    try:
+        data = _http_get(DART_CORP_CACHE_URL, timeout=(2, 4)).json()
+        corps = []
+        if isinstance(data, dict):
+            for stock_code, item in data.items():
+                corp_code = str((item or {}).get("corp_code", "")).strip()
+                corp_name = str((item or {}).get("corp_name", "")).strip()
+                stock_code = str(stock_code).strip()
+                if corp_code and corp_name and stock_code:
+                    corps.append(
+                        {
+                            "corp_code": corp_code,
+                            "corp_name": corp_name,
+                            "stock_code": stock_code,
+                        }
+                    )
+        if corps:
+            _DART_CORPS = corps
+            return corps
+    except Exception:
+        pass
+
+    # fallback: 공식 OpenDART 전체 고유번호 파일.
+    r = _http_get(
+        f"{DART_BASE}/corpCode.xml",
+        params={"crtfc_key": _dart_key()},
+        timeout=(2, 6),
+    )
     try:
         zf = zipfile.ZipFile(BytesIO(r.content))
         xml_bytes = zf.read(zf.namelist()[0])
@@ -131,7 +161,11 @@ def _resolve_kr_company(q):
 
 def _dart_json(endpoint, params):
     p = {"crtfc_key": _dart_key(), **params}
-    data = _http_get(f"{DART_BASE}/{endpoint}", params=p).json()
+    data = _http_get(
+        f"{DART_BASE}/{endpoint}",
+        params=p,
+        timeout=(2, 5),
+    ).json()
     if data.get("status") not in (None, "000"):
         return None
     return data
@@ -139,15 +173,18 @@ def _dart_json(endpoint, params):
 
 def _dart_annual_rows(corp_code, year):
     for fs_div in ("CFS", "OFS"):
-        data = _dart_json(
-            "fnlttSinglAcntAll.json",
-            {
-                "corp_code": corp_code,
-                "bsns_year": str(year),
-                "reprt_code": "11011",
-                "fs_div": fs_div,
-            },
-        )
+        try:
+            data = _dart_json(
+                "fnlttSinglAcntAll.json",
+                {
+                    "corp_code": corp_code,
+                    "bsns_year": str(year),
+                    "reprt_code": "11011",
+                    "fs_div": fs_div,
+                },
+            )
+        except Exception:
+            data = None
         if data and data.get("list"):
             return data["list"], fs_div
     return None, None
