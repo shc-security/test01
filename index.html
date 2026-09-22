@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lattice Stock Analyzer</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:#111827; background:#f3f4f6; }
+    * { box-sizing:border-box; }
+    body { margin:0; padding:20px; }
+    .wrap { max-width:760px; margin:0 auto; }
+    .card { background:white; border-radius:18px; padding:20px; box-shadow:0 6px 24px rgba(0,0,0,.06); margin-bottom:16px; }
+    h1 { margin:0 0 6px; font-size:28px; }
+    .sub { color:#6b7280; font-size:14px; margin-bottom:20px; }
+    .row { display:grid; grid-template-columns:110px 1fr; gap:10px; margin-bottom:10px; }
+    select,input,button { width:100%; padding:13px 14px; border-radius:12px; border:1px solid #d1d5db; font-size:16px; }
+    button { border:0; background:#111827; color:white; font-weight:700; cursor:pointer; }
+    button:disabled { opacity:.55; }
+    .score { font-size:48px; font-weight:800; margin:4px 0; }
+    .muted { color:#6b7280; font-size:13px; }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:16px; }
+    .metric { background:#f9fafb; padding:13px; border-radius:12px; }
+    .metric b { display:block; font-size:17px; margin-top:4px; }
+    table { width:100%; border-collapse:collapse; font-size:14px; }
+    th,td { text-align:left; border-bottom:1px solid #e5e7eb; padding:9px 4px; }
+    .err { color:#b91c1c; white-space:pre-wrap; }
+    .hidden { display:none; }
+    @media (max-width:560px) {
+      body { padding:12px; }
+      .row { grid-template-columns:1fr; }
+      .grid { grid-template-columns:1fr; }
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>Lattice Stock Analyzer</h1>
+    <div class="sub">OpenDART + SEC EDGAR 기반 무료 파일럿 LFS 분석기</div>
+
+    <div class="row">
+      <select id="market">
+        <option value="KR">한국</option>
+        <option value="US">미국</option>
+      </select>
+      <input id="q" placeholder="삼성전자 / 005930 / NVDA">
+    </div>
+    <button id="go">분석</button>
+    <div id="status" class="muted" style="margin-top:12px"></div>
+  </div>
+
+  <div id="result" class="hidden">
+    <div class="card">
+      <div id="name" style="font-weight:700"></div>
+      <div class="score"><span id="score"></span><span style="font-size:20px"> / 100</span></div>
+      <div id="price" class="muted"></div>
+      <div class="grid" id="metrics"></div>
+    </div>
+
+    <div class="card">
+      <h3>구성 점수</h3>
+      <table><tbody id="components"></tbody></table>
+    </div>
+
+    <div class="card">
+      <h3>주의</h3>
+      <div class="muted">
+        현재 버전은 업종별 percentile 정규화 전의 파일럿입니다. 은행·보험·증권처럼 일반 제조/서비스업과 자본구조가 다른 업종에는 ROIC 해석이 적합하지 않을 수 있습니다.
+        무료 가격 데이터는 비공식 fallback이므로 지연·누락 가능성이 있습니다.
+      </div>
+    </div>
+  </div>
+
+  <div id="error" class="card err hidden"></div>
+</div>
+
+<script>
+function pct(v) {
+  if (v === null || v === undefined) return "-";
+  return (v * 100).toFixed(1) + "%";
+}
+function num(v) {
+  if (v === null || v === undefined) return "-";
+  return Number(v).toLocaleString(undefined, {maximumFractionDigits:1});
+}
+function addMetric(root, label, value) {
+  var d = document.createElement("div");
+  d.className = "metric";
+  d.innerHTML = '<span class="muted">' + label + '</span><b>' + value + '</b>';
+  root.appendChild(d);
+}
+document.getElementById("go").onclick = async function() {
+  var btn = this;
+  var market = document.getElementById("market").value;
+  var q = document.getElementById("q").value.trim();
+  var status = document.getElementById("status");
+  var err = document.getElementById("error");
+  var result = document.getElementById("result");
+
+  err.classList.add("hidden");
+  result.classList.add("hidden");
+  if (!q) { status.textContent = "종목명을 입력하세요."; return; }
+
+  btn.disabled = true;
+  status.textContent = "공시 데이터를 불러와 계산 중...";
+  try {
+    var res = await fetch("/api/analyze?market=" + encodeURIComponent(market) + "&q=" + encodeURIComponent(q));
+    var body = await res.json();
+    if (!body.ok) throw new Error(body.error || "분석 실패");
+    var d = body.data;
+
+    document.getElementById("name").textContent = d.company + " (" + d.ticker + ")";
+    document.getElementById("score").textContent = d.score.toFixed(1);
+    document.getElementById("price").textContent =
+      d.price && d.price.price ? "가격 참고: " + num(d.price.price) + " " + (d.price.currency || "") : "가격 데이터 없음";
+
+    var metrics = document.getElementById("metrics");
+    metrics.innerHTML = "";
+    addMetric(metrics, "ROIC proxy", pct(d.metrics.roic_proxy));
+    addMetric(metrics, "Incremental ROIC proxy", pct(d.metrics.incremental_roic_proxy));
+    addMetric(metrics, "매출 CAGR", pct(d.metrics.revenue_cagr));
+    addMetric(metrics, "Cash Conversion", d.metrics.cash_conversion == null ? "-" : d.metrics.cash_conversion.toFixed(2) + "x");
+    addMetric(metrics, "FCF Margin", pct(d.metrics.fcf_margin));
+    addMetric(metrics, "현재 영업마진", pct(d.metrics.operating_margin));
+    addMetric(metrics, "정상화 영업마진", pct(d.metrics.normalized_operating_margin));
+    addMetric(metrics, "Normalized NOPAT Yield", pct(d.metrics.normalized_nopat_yield));
+
+    var labels = {
+      moat_proxy:"해자 Proxy",
+      capital_efficiency:"자본효율성",
+      growth_reinvestment_proxy:"성장·재투자 Proxy",
+      cash_quality:"현금흐름·이익의 질",
+      financial_strength:"재무건전성",
+      persistence_normalization:"지속성·정상화",
+      valuation:"밸류에이션"
+    };
+    var maxes = {
+      moat_proxy:15,
+      capital_efficiency:20,
+      growth_reinvestment_proxy:15,
+      cash_quality:15,
+      financial_strength:10,
+      persistence_normalization:10,
+      valuation:15
+    };
+    var tbody = document.getElementById("components");
+    tbody.innerHTML = "";
+    Object.keys(labels).forEach(function(k) {
+      var tr = document.createElement("tr");
+      tr.innerHTML = "<td>" + labels[k] + "</td><td><b>" + d.components[k].toFixed(1) + " / " + maxes[k] + "</b></td>";
+      tbody.appendChild(tr);
+    });
+
+    result.classList.remove("hidden");
+    status.textContent = "완료 · 최근 연간 공시 기준";
+  } catch (e) {
+    err.textContent = e.message;
+    err.classList.remove("hidden");
+    status.textContent = "";
+  } finally {
+    btn.disabled = false;
+  }
+};
+</script>
+</body>
+</html>
