@@ -209,10 +209,19 @@ def _dart_annual_rows(corp_code, year):
 
 
 def _dart_company_info(corp_code):
-    try:
-        return _dart_json("company.json", {"corp_code": corp_code}) or {}
-    except Exception:
-        return {}
+    params = {"crtfc_key": _dart_key(), "corp_code": corp_code}
+    for timeout in ((1.5, 4.5), (2, 7)):
+        try:
+            data = _http_get(
+                f"{DART_BASE}/company.json",
+                params=params,
+                timeout=timeout,
+            ).json()
+            if data.get("status") in (None, "000"):
+                return data
+        except Exception:
+            continue
+    return {}
 
 
 def _sj_match(value, sj):
@@ -266,13 +275,29 @@ def _dart_metrics_from_rows(
     cash_key = cash_key or income_key
     income_sj = ("IS", "CIS")
 
-    revenue = _row_value(
-        rows,
-        ids=("ifrs-full_Revenue", "ifrs-full_RevenueFromContractsWithCustomers"),
-        names=("매출액", "영업수익", "수익(매출액)", "수익"),
-        sj=income_sj,
-        amount_key=income_key,
-    )
+    # Revenue tags can coexist with extension/legacy tags. Prefer an exact
+    # consolidated revenue label first; fall back to standardized IDs.
+    revenue = None
+    exact_revenue_names = {"매출액", "수익(매출액)", "영업수익"}
+    revenue_candidates = []
+    for r in rows:
+        if not _sj_match(r.get("sj_div"), income_sj):
+            continue
+        nm = (r.get("account_nm") or "").replace(" ", "")
+        if nm in exact_revenue_names:
+            v = _jnum(r.get(income_key))
+            if v is not None:
+                revenue_candidates.append(v)
+    if revenue_candidates:
+        revenue = max(revenue_candidates, key=lambda x: abs(x))
+    else:
+        revenue = _row_value(
+            rows,
+            ids=("ifrs-full_RevenueFromContractsWithCustomers", "ifrs-full_Revenue"),
+            names=("매출액", "영업수익", "수익(매출액)", "수익"),
+            sj=income_sj,
+            amount_key=income_key,
+        )
     op_income = _row_value(
         rows,
         ids=("dart_OperatingIncomeLoss",),
@@ -374,7 +399,7 @@ def _dart_interim_ttm(annual_latest, rows, year, reprt_code, fs_div):
 
     # Cash-flow statements in DART are cumulative YTD already.
     current_cash_key = "thstrm_amount"
-    prior_cash_key = "frmtrm_amount"
+    prior_cash_key = "frmtrm_add_amount"
 
     current_ytd = _dart_metrics_from_rows(
         rows,
@@ -421,17 +446,61 @@ def _dart_interim_ttm(annual_latest, rows, year, reprt_code, fs_div):
 
 
 def _dart_share_count(corp_code, year, reprt_code="11011"):
-    data = _dart_json(
-        "stockTotqySttus.json",
-        {"corp_code": corp_code, "bsns_year": str(year), "reprt_code": reprt_code},
-    )
-    if not data or not data.get("list"):
+    params = {
+        "crtfc_key": _dart_key(),
+        "corp_code": corp_code,
+        "bsns_year": str(year),
+        "reprt_code": reprt_code,
+    }
+    data = None
+    for timeout in ((1.5, 4.5), (2, 7)):
+        try:
+            candidate = _http_get(
+                f"{DART_BASE}/stockTotqySttus.json",
+                params=params,
+                timeout=timeout,
+            ).json()
+            if candidate.get("status") in (None, "000") and candidate.get("list"):
+                data = candidate
+                break
+        except Exception:
+            continue
+    if not data:
         return None
-    vals = []
-    for r in data["list"]:
+
+    rows = data.get("list") or []
+
+    # Prefer the explicit total row when available.
+    total_markers = ("합계", "계", "total")
+    for r in rows:
+        se = str(r.get("se") or "").strip().lower()
+        if any(m in se for m in total_markers):
+            for key in ("distb_stock_co", "istc_totqy"):
+                v = _jnum(r.get(key))
+                if v is not None and v > 0:
+                    return v
+
+    # Otherwise sum individual share classes, excluding notes/total-like rows.
+    class_vals = []
+    for r in rows:
+        se = str(r.get("se") or "").strip().lower()
+        if any(m in se for m in ("합계", "total", "비고", "note")):
+            continue
         v = _jnum(r.get("distb_stock_co"))
+        if v is None or v <= 0:
+            v = _jnum(r.get("istc_totqy"))
         if v is not None and v > 0:
-            vals.append(v)
+            class_vals.append(v)
+    if class_vals:
+        return sum(class_vals)
+
+    # Last resort: maximum disclosed positive issued/distributed count.
+    vals = []
+    for r in rows:
+        for key in ("distb_stock_co", "istc_totqy"):
+            v = _jnum(r.get(key))
+            if v is not None and v > 0:
+                vals.append(v)
     return max(vals) if vals else None
 
 
@@ -1113,20 +1182,32 @@ def _compute_lfs(series, tax_rate, price=None, shares=None, current=None, indust
         if normalized_fcf is not None and market_cap and market_cap > 0 else None
     )
 
-    current_valuation = (
-        _score_linear(current_nopat_yield, 0.005, 0.09, 8)
-        + _score_linear(current_fcf_yield, 0.00, 0.10, 7)
-    )
-    normalized_valuation = (
-        _score_linear(normalized_nopat_yield, 0.005, 0.07, 8)
-        + _score_linear(normalized_fcf_yield, 0.00, 0.08, 7)
-    )
+    valuation_available = market_cap is not None and market_cap > 0
+    if valuation_available:
+        current_valuation = (
+            _score_linear(current_nopat_yield, 0.005, 0.09, 8)
+            + _score_linear(current_fcf_yield, 0.00, 0.10, 7)
+        )
+        normalized_valuation = (
+            _score_linear(normalized_nopat_yield, 0.005, 0.07, 8)
+            + _score_linear(normalized_fcf_yield, 0.00, 0.08, 7)
+        )
+    else:
+        current_valuation = None
+        normalized_valuation = None
 
     current_quality_score = round(sum(current_components.values()), 1)
     normalized_quality_score = round(sum(normalized_components.values()), 1)
-    current_score = round(current_quality_score + current_valuation, 1)
-    normalized_score = round(normalized_quality_score + normalized_valuation, 1)
-    blended_score = round(0.4 * current_score + 0.6 * normalized_score, 1)
+
+    if valuation_available:
+        current_score = round(current_quality_score + current_valuation, 1)
+        normalized_score = round(normalized_quality_score + normalized_valuation, 1)
+        blended_score = round(0.4 * current_score + 0.6 * normalized_score, 1)
+    else:
+        # Keep a usable quality-only score but flag it as non-comparable to full LFS.
+        current_score = round(current_quality_score / 85.0 * 100.0, 1)
+        normalized_score = round(normalized_quality_score / 85.0 * 100.0, 1)
+        blended_score = round(0.4 * current_score + 0.6 * normalized_score, 1)
 
     sector = (industry or {}).get("sector") or "General"
     industry_percentile_current = _industry_percentile(
@@ -1158,8 +1239,9 @@ def _compute_lfs(series, tax_rate, price=None, shares=None, current=None, indust
         "normalized_score": normalized_score,
         "current_quality_score": current_quality_score,
         "normalized_quality_score": normalized_quality_score,
-        "current_valuation_score": round(current_valuation, 1),
-        "normalized_valuation_score": round(normalized_valuation, 1),
+        "valuation_available": valuation_available,
+        "current_valuation_score": round(current_valuation, 1) if current_valuation is not None else None,
+        "normalized_valuation_score": round(normalized_valuation, 1) if normalized_valuation is not None else None,
         "current_components": current_components,
         "normalized_components": normalized_components,
         "components": normalized_components,
@@ -1202,8 +1284,8 @@ def _compute_lfs(series, tax_rate, price=None, shares=None, current=None, indust
         "history": clean,
         "current_data": current_row,
         "methodology": {
-            "version": "pilot-0.3",
-            "main_score": "40% current + 60% normalized",
+            "version": "pilot-0.3.1",
+            "main_score": "40% current + 60% normalized; quality-only rescaled when valuation data is unavailable",
             "industry_percentile_method": "sector-adjusted parametric benchmark; not yet a live peer cross-section",
             "note": "TTM이 가능하면 현재점수는 TTM을 사용하고, 정상화점수는 최근 연간 분포의 중앙값/지속성을 사용합니다. 업종 percentile은 무료 즉시조회 버전의 섹터 benchmark CDF입니다.",
         },
