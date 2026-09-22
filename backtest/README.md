@@ -30,3 +30,7 @@ A 10-year forward test available in 2026 necessarily has very few independent an
 OpenDART full financial statements are officially provided for business years from 2015 onward, so early backtest cohorts have less history than recent cohorts. The backtest records this rather than using future history to fill the past.
 
 The UI remains disabled until the validation gates pass on the full run. This is deliberate: a partial or survivorship-biased backtest is not published as evidence.
+
+## Secret setup verification
+
+The push-triggered smoke test checks whether the repository `DART_API_KEY` Actions secret is available before running the point-in-time data smoke test.
