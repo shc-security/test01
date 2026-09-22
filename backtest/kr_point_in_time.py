@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import pandas as pd
@@ -688,20 +689,39 @@ def run(args):
         )
         scored = []
         errors = []
-        for idx, (cap_row, corp) in enumerate(mapped, start=1):
+
+        def score_one(item):
+            cap_row, corp = item
             try:
-                s = snapshot_score(dart, corp, cap_row["ticker"], asof, cap_snapshot)
-                scored.append(s)
+                return (
+                    snapshot_score(dart, corp, cap_row["ticker"], asof, cap_snapshot),
+                    None,
+                )
             except Exception as exc:
-                errors.append(
+                return (
+                    None,
                     {
                         "ticker": cap_row["ticker"],
                         "name": corp.get("corp_name"),
                         "error": str(exc),
-                    }
+                    },
                 )
-            if idx % 10 == 0:
-                print(f"{year}: scored {idx}/{len(mapped)}; valid={len(scored)}")
+
+        completed = 0
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            jobs = [ex.submit(score_one, item) for item in mapped]
+            for future in as_completed(jobs):
+                s, err = future.result()
+                if s:
+                    scored.append(s)
+                if err:
+                    errors.append(err)
+                completed += 1
+                if completed % 10 == 0 or completed == len(mapped):
+                    print(
+                        f"{year}: scored {completed}/{len(mapped)}; valid={len(scored)}",
+                        flush=True,
+                    )
 
         score_coverage = len(scored) / len(mapped) if mapped else 0.0
         ranked = rank_scores(scored, top_n=args.top_n)
@@ -798,6 +818,7 @@ if __name__ == "__main__":
     p.add_argument("--end-year", type=int, default=2025)
     p.add_argument("--universe-size", type=int, default=100)
     p.add_argument("--top-n", type=int, default=10)
+    p.add_argument("--workers", type=int, default=4)
     p.add_argument("--min-mapping-coverage", type=float, default=0.95)
     p.add_argument("--min-score-coverage", type=float, default=0.80)
     args = p.parse_args()
