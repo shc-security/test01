@@ -171,8 +171,11 @@ document.getElementById("go").onclick = async function() {
     addMetric(metrics, "정상화 점수", d.normalized_score.toFixed(1) + " / 100");
     addMetric(metrics, "현재 Quality", d.current_quality_score.toFixed(1) + " / 85");
     addMetric(metrics, "정상화 Quality", d.normalized_quality_score.toFixed(1) + " / 85");
-    addMetric(metrics, "현재 Valuation", d.current_valuation_score.toFixed(1) + " / 15");
-    addMetric(metrics, "정상화 Valuation", d.normalized_valuation_score.toFixed(1) + " / 15");
+    addMetric(metrics, "현재 Valuation", d.current_valuation_score == null ? "N/A" : d.current_valuation_score.toFixed(1) + " / 15");
+    addMetric(metrics, "정상화 Valuation", d.normalized_valuation_score == null ? "N/A" : d.normalized_valuation_score.toFixed(1) + " / 15");
+    if (d.valuation_available === false) {
+      addMetric(metrics, "점수 상태", "Quality-only (밸류 데이터 없음)");
+    }
     addMetric(metrics, "현재 ROIC proxy", pct(d.metrics.roic_proxy));
     addMetric(metrics, "5Y/6Y Median ROIC proxy", pct(d.metrics.median_roic_proxy));
     addMetric(metrics, "Rolling 3Y iROIC Median", pct(d.metrics.rolling_3y_incremental_roic_median));
@@ -227,8 +230,8 @@ document.getElementById("go").onclick = async function() {
     var trv = document.createElement("tr");
     trv.innerHTML =
       "<td>밸류에이션</td>" +
-      "<td><b>" + d.current_valuation_score.toFixed(1) + "</b></td>" +
-      "<td><b>" + d.normalized_valuation_score.toFixed(1) + "</b></td>" +
+      "<td><b>" + (d.current_valuation_score == null ? "N/A" : d.current_valuation_score.toFixed(1)) + "</b></td>" +
+      "<td><b>" + (d.normalized_valuation_score == null ? "N/A" : d.normalized_valuation_score.toFixed(1)) + "</b></td>" +
       "<td>15</td>";
     tbody.appendChild(trv);
 
