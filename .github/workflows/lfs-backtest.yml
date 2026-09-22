@@ -30,7 +30,17 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r backtest/requirements.txt
+      - run: python -m py_compile backtest/core.py backtest/kr_point_in_time.py
       - run: pytest -q backtest/test_core.py
+      - name: KRX historical connectivity smoke
+        run: |
+          python - <<'PY'
+          from pykrx import stock
+          df = stock.get_market_cap_by_ticker("20240603", market="KOSPI")
+          if df is None or df.empty:
+              raise SystemExit("KRX historical market-cap data is empty")
+          print("KRX rows:", len(df))
+          PY
 
   smoke:
     if: github.event_name == 'push'
