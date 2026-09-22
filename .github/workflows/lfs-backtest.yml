@@ -1,5 +1,9 @@
 name: LFS point-in-time backtest
 
+concurrency:
+  group: lfs-point-in-time-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   workflow_dispatch:
     inputs:
@@ -109,6 +113,7 @@ jobs:
           --end-year ${{ inputs.end_year || '2025' }}
           --universe-size ${{ inputs.universe_size || '100' }}
           --top-n 10
+          --workers 4
           --min-mapping-coverage 0.95
           --min-score-coverage 0.80
       - uses: actions/upload-artifact@v4
