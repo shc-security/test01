@@ -254,28 +254,38 @@ def _first_existing_amount_key(rows, candidates):
     return candidates[-1]
 
 
-def _dart_metrics_from_rows(rows, flow_key="thstrm_amount", balance_key="thstrm_amount"):
+def _dart_metrics_from_rows(
+    rows,
+    income_key="thstrm_amount",
+    cash_key=None,
+    balance_key="thstrm_amount",
+):
+    # DART interim reports are asymmetric:
+    # IS/CIS may expose quarter + cumulative columns (*_add_amount),
+    # while CF is already cumulative and normally uses *_amount.
+    cash_key = cash_key or income_key
     income_sj = ("IS", "CIS")
+
     revenue = _row_value(
         rows,
         ids=("ifrs-full_Revenue", "ifrs-full_RevenueFromContractsWithCustomers"),
         names=("매출액", "영업수익", "수익(매출액)", "수익"),
         sj=income_sj,
-        amount_key=flow_key,
+        amount_key=income_key,
     )
     op_income = _row_value(
         rows,
         ids=("dart_OperatingIncomeLoss",),
         names=("영업이익", "영업이익(손실)", "영업손익"),
         sj=income_sj,
-        amount_key=flow_key,
+        amount_key=income_key,
     )
     net_income = _row_value(
         rows,
         ids=("ifrs-full_ProfitLoss",),
         names=("당기순이익", "당기순이익(손실)", "연결당기순이익", "분기순이익", "반기순이익"),
         sj=income_sj,
-        amount_key=flow_key,
+        amount_key=income_key,
     )
     assets = _row_value(
         rows,
@@ -303,14 +313,14 @@ def _dart_metrics_from_rows(rows, flow_key="thstrm_amount", balance_key="thstrm_
         ids=("ifrs-full_CashFlowsFromUsedInOperatingActivities",),
         names=("영업활동현금흐름", "영업활동으로인한현금흐름"),
         sj="CF",
-        amount_key=flow_key,
+        amount_key=cash_key,
     )
     capex = _row_value(
         rows,
         ids=("ifrs-full_PurchaseOfPropertyPlantAndEquipment",),
         names=("유형자산의취득", "유형자산 취득", "유형자산취득"),
         sj="CF",
-        amount_key=flow_key,
+        amount_key=cash_key,
     )
     if capex is not None:
         capex = abs(capex)
@@ -352,25 +362,48 @@ def _dart_interim_ttm(annual_latest, rows, year, reprt_code, fs_div):
         return None
 
     if reprt_code in ("11012", "11014"):
-        cur_flow_key = _first_existing_amount_key(rows, ("thstrm_add_amount", "thstrm_amount"))
-        prev_flow_key = _first_existing_amount_key(rows, ("frmtrm_add_amount", "frmtrm_amount"))
+        current_income_key = _first_existing_amount_key(
+            rows, ("thstrm_add_amount", "thstrm_amount")
+        )
+        prior_income_key = _first_existing_amount_key(
+            rows, ("frmtrm_add_amount", "frmtrm_amount")
+        )
     else:
-        cur_flow_key = "thstrm_amount"
-        prev_flow_key = "frmtrm_amount"
+        current_income_key = "thstrm_amount"
+        prior_income_key = "frmtrm_amount"
 
-    current_ytd = _dart_metrics_from_rows(rows, flow_key=cur_flow_key, balance_key="thstrm_amount")
-    prior_ytd = _dart_metrics_from_rows(rows, flow_key=prev_flow_key, balance_key="frmtrm_amount")
+    # Cash-flow statements in DART are cumulative YTD already.
+    current_cash_key = "thstrm_amount"
+    prior_cash_key = "frmtrm_amount"
+
+    current_ytd = _dart_metrics_from_rows(
+        rows,
+        income_key=current_income_key,
+        cash_key=current_cash_key,
+        balance_key="thstrm_amount",
+    )
+    prior_ytd = _dart_metrics_from_rows(
+        rows,
+        income_key=prior_income_key,
+        cash_key=prior_cash_key,
+        balance_key="frmtrm_amount",
+    )
 
     flow_fields = ("revenue", "operating_income", "net_income", "cfo", "capex")
-    if current_ytd.get("revenue") is None or prior_ytd.get("revenue") is None:
+    if (
+        current_ytd.get("revenue") is None
+        or prior_ytd.get("revenue") is None
+        or current_ytd.get("operating_income") is None
+        or prior_ytd.get("operating_income") is None
+    ):
         return None
 
     out = {"year": year, "is_ttm": True, "fs_div": fs_div}
     for k in flow_fields:
-        a = annual_latest.get(k)
+        annual = annual_latest.get(k)
         cy = current_ytd.get(k)
         py = prior_ytd.get(k)
-        out[k] = (a + cy - py) if a is not None and cy is not None and py is not None else a
+        out[k] = (annual + cy - py) if annual is not None and cy is not None and py is not None else annual
 
     for k in ("assets", "equity", "cash", "debt"):
         out[k] = current_ytd.get(k) if current_ytd.get(k) is not None else annual_latest.get(k)
@@ -378,6 +411,12 @@ def _dart_interim_ttm(annual_latest, rows, year, reprt_code, fs_div):
     label = {"11013": "Q1", "11012": "H1", "11014": "Q3"}.get(reprt_code, reprt_code)
     out["basis"] = f"TTM {year} {label}"
     out["report_code"] = reprt_code
+    out["ttm_bridge"] = {
+        "annual_year": annual_latest.get("year"),
+        "annual": {k: annual_latest.get(k) for k in flow_fields},
+        "current_ytd": {k: current_ytd.get(k) for k in flow_fields},
+        "prior_ytd": {k: prior_ytd.get(k) for k in flow_fields},
+    }
     return out
 
 
@@ -1153,6 +1192,12 @@ def _compute_lfs(series, tax_rate, price=None, shares=None, current=None, indust
             "current_fcf_yield": current_fcf_yield,
             "normalized_nopat_yield": normalized_nopat_yield,
             "normalized_fcf_yield": normalized_fcf_yield,
+            "current_revenue": current_row.get("revenue"),
+            "current_operating_income": current_row.get("operating_income"),
+            "current_net_income": current_row.get("net_income"),
+            "current_cfo": current_row.get("cfo"),
+            "current_capex": current_row.get("capex"),
+            "current_fcf": current_row.get("fcf"),
         },
         "history": clean,
         "current_data": current_row,
@@ -1238,7 +1283,7 @@ def analyze_kr(q):
             y = report_year - offset
             if y in rows_by_year:
                 continue
-            m = _dart_metrics_from_rows(raw, flow_key=amount_key, balance_key=amount_key)
+            m = _dart_metrics_from_rows(raw, income_key=amount_key, cash_key=amount_key, balance_key=amount_key)
             if m.get("revenue") is None or m.get("operating_income") is None:
                 continue
             m["year"] = y
@@ -1274,7 +1319,8 @@ def analyze_kr(q):
     industry = {
         "sector": sector,
         "industry_code": industry_code,
-        "industry_name": company_info.get("corp_cls") or sector,
+        "industry_name": sector,
+        "market_class": company_info.get("corp_cls"),
     }
 
     result = _compute_lfs(
