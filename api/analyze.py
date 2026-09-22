@@ -590,258 +590,646 @@ def _sec_series(cf):
     return rows
 
 
-def _compute_lfs(series, tax_rate, price=None, shares=None):
+
+def _sec_entries(cf, tags, units=("USD",)):
+    facts = cf.get("facts", {}).get("us-gaap", {})
+    for tag in tags:
+        block = facts.get(tag, {})
+        unit_map = block.get("units", {})
+        for unit in units:
+            entries = unit_map.get(unit)
+            if entries:
+                return entries
+    return []
+
+
+def _date_days(start, end):
+    try:
+        return (datetime.fromisoformat(end) - datetime.fromisoformat(start)).days
+    except Exception:
+        return None
+
+
+def _sec_latest_ytd_pair(cf, tags):
+    entries = _sec_entries(cf, tags)
+    candidates = []
+    for e in entries:
+        if e.get("form") not in ("10-Q", "10-Q/A"):
+            continue
+        if e.get("fp") not in ("Q1", "Q2", "Q3"):
+            continue
+        if not e.get("start") or not e.get("end"):
+            continue
+        val = _jnum(e.get("val"))
+        dur = _date_days(e.get("start"), e.get("end"))
+        if val is None or dur is None or dur < 50 or dur > 310:
+            continue
+        candidates.append(
+            {
+                "val": val,
+                "start": e.get("start"),
+                "end": e.get("end"),
+                "filed": e.get("filed", ""),
+                "fp": e.get("fp"),
+                "dur": dur,
+            }
+        )
+    if not candidates:
+        return None, None
+
+    latest_end = max(x["end"] for x in candidates)
+    same_end = [x for x in candidates if x["end"] == latest_end]
+    current = max(same_end, key=lambda x: (x["dur"], x["filed"]))
+
+    prior_candidates = []
+    for x in candidates:
+        if x["end"] >= current["end"] or x["fp"] != current["fp"]:
+            continue
+        try:
+            gap = (datetime.fromisoformat(current["end"]) - datetime.fromisoformat(x["end"])).days
+        except Exception:
+            continue
+        if 320 <= gap <= 410 and abs(x["dur"] - current["dur"]) <= 35:
+            prior_candidates.append(x)
+    prior = max(prior_candidates, key=lambda x: (x["end"], x["filed"])) if prior_candidates else None
+    return current, prior
+
+
+def _sec_latest_instant(cf, tags):
+    entries = _sec_entries(cf, tags)
+    candidates = []
+    for e in entries:
+        if e.get("form") not in ("10-Q", "10-Q/A", "10-K", "10-K/A"):
+            continue
+        val = _jnum(e.get("val"))
+        end = e.get("end")
+        if val is None or not end:
+            continue
+        candidates.append((end, e.get("filed", ""), val))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[-1][2]
+
+
+def _sec_ttm_row(cf, annual_latest):
+    if not annual_latest:
+        return None
+
+    flow_tags = {
+        "revenue": (
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "Revenues",
+            "SalesRevenueNet",
+        ),
+        "operating_income": ("OperatingIncomeLoss",),
+        "net_income": ("NetIncomeLoss", "ProfitLoss"),
+        "cfo": ("NetCashProvidedByUsedInOperatingActivities",),
+        "capex": (
+            "PaymentsToAcquirePropertyPlantAndEquipment",
+            "PaymentsToAcquireProductiveAssets",
+        ),
+    }
+    balance_tags = {
+        "assets": ("Assets",),
+        "equity": (
+            "StockholdersEquity",
+            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+        ),
+        "cash": (
+            "CashAndCashEquivalentsAtCarryingValue",
+            "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+        ),
+    }
+
+    pairs = {k: _sec_latest_ytd_pair(cf, tags) for k, tags in flow_tags.items()}
+    rev_cur, rev_prev = pairs["revenue"]
+    if not rev_cur or not rev_prev:
+        return None
+
+    out = {"year": int(rev_cur["end"][:4]), "is_ttm": True, "basis": f"TTM through {rev_cur['end']}"}
+    for k in flow_tags:
+        cur, prev = pairs[k]
+        annual = annual_latest.get(k)
+        if k == "capex":
+            annual = abs(annual) if annual is not None else None
+        if cur and prev and annual is not None:
+            val = annual + cur["val"] - prev["val"]
+            out[k] = abs(val) if k == "capex" else val
+        else:
+            out[k] = annual
+
+    for k, tags in balance_tags.items():
+        out[k] = _sec_latest_instant(cf, tags)
+        if out[k] is None:
+            out[k] = annual_latest.get(k)
+
+    debt_parts = []
+    for tag in ("LongTermDebtCurrent", "LongTermDebtNoncurrent", "ShortTermBorrowings"):
+        v = _sec_latest_instant(cf, (tag,))
+        if v is not None:
+            debt_parts.append(v)
+    if debt_parts:
+        out["debt"] = sum(debt_parts)
+    else:
+        out["debt"] = annual_latest.get("debt")
+
+    return out
+
+
+def _sec_submissions(cik):
+    url = f"{SEC_BASE}/submissions/CIK{cik:010d}.json"
+    try:
+        return _http_get(url, headers=_sec_headers(), timeout=(2, 5)).json()
+    except Exception:
+        return {}
+
+
+def _sector_from_kr_industry(code):
+    s = str(code or "").strip()
+    p2 = s[:2] if len(s) >= 2 else ""
+    if p2 in {"26", "27", "28", "58", "62", "63"}:
+        return "Technology"
+    if p2 in {"21", "86"}:
+        return "Healthcare"
+    if p2 in {"64", "65", "66"}:
+        return "Financials"
+    if p2 in {"35", "36"}:
+        return "Utilities"
+    if p2 in {"68"}:
+        return "RealEstate"
+    if p2 in {"19", "20", "23", "24"}:
+        return "Materials"
+    if p2 in {"05", "06", "07", "08", "09"}:
+        return "Energy"
+    if p2 in {"10", "11", "12", "13", "14", "15", "31", "45", "46", "47", "55", "56"}:
+        return "Consumer"
+    if p2 in {"49", "50", "51", "52", "53", "59", "60", "61"}:
+        return "Communication"
+    if p2 in {"25", "29", "30", "32", "33", "41", "42"}:
+        return "Industrials"
+    return "General"
+
+
+def _sector_from_sic(sic):
+    try:
+        x = int(sic)
+    except Exception:
+        return "General"
+    if 3570 <= x <= 3579 or 3670 <= x <= 3699 or 7370 <= x <= 7379:
+        return "Technology"
+    if 2830 <= x <= 2836 or 3840 <= x <= 3851 or 8000 <= x <= 8099:
+        return "Healthcare"
+    if 6000 <= x <= 6799:
+        return "Financials"
+    if 4900 <= x <= 4999:
+        return "Utilities"
+    if 6500 <= x <= 6559:
+        return "RealEstate"
+    if 1000 <= x <= 1499 or 2800 <= x <= 2899 or 3200 <= x <= 3499:
+        return "Materials"
+    if 1300 <= x <= 1389 or 2900 <= x <= 2999:
+        return "Energy"
+    if 2000 <= x <= 2399 or 2500 <= x <= 2599 or 5000 <= x <= 5999:
+        return "Consumer"
+    if 4800 <= x <= 4899 or 7800 <= x <= 7899:
+        return "Communication"
+    if 1500 <= x <= 1799 or 3500 <= x <= 3569 or 3700 <= x <= 3799 or 4000 <= x <= 4799:
+        return "Industrials"
+    return "General"
+
+
+SECTOR_BENCHMARKS = {
+    "Technology": {"roic": (0.12, 0.08), "margin": (0.15, 0.10), "growth": (0.08, 0.09), "fcf": (0.10, 0.08), "yield": (0.04, 0.025)},
+    "Healthcare": {"roic": (0.09, 0.09), "margin": (0.12, 0.15), "growth": (0.08, 0.12), "fcf": (0.07, 0.10), "yield": (0.04, 0.03)},
+    "Financials": {"roic": (0.07, 0.05), "margin": (0.15, 0.10), "growth": (0.05, 0.07), "fcf": (0.08, 0.08), "yield": (0.055, 0.03)},
+    "Utilities": {"roic": (0.06, 0.04), "margin": (0.10, 0.06), "growth": (0.03, 0.04), "fcf": (0.04, 0.07), "yield": (0.055, 0.025)},
+    "RealEstate": {"roic": (0.06, 0.05), "margin": (0.18, 0.12), "growth": (0.04, 0.07), "fcf": (0.08, 0.10), "yield": (0.06, 0.03)},
+    "Materials": {"roic": (0.08, 0.06), "margin": (0.09, 0.07), "growth": (0.05, 0.08), "fcf": (0.06, 0.08), "yield": (0.055, 0.03)},
+    "Energy": {"roic": (0.09, 0.08), "margin": (0.10, 0.08), "growth": (0.04, 0.12), "fcf": (0.08, 0.11), "yield": (0.06, 0.04)},
+    "Consumer": {"roic": (0.10, 0.07), "margin": (0.10, 0.08), "growth": (0.06, 0.07), "fcf": (0.07, 0.07), "yield": (0.045, 0.025)},
+    "Communication": {"roic": (0.09, 0.07), "margin": (0.14, 0.10), "growth": (0.06, 0.08), "fcf": (0.09, 0.08), "yield": (0.045, 0.03)},
+    "Industrials": {"roic": (0.09, 0.06), "margin": (0.09, 0.06), "growth": (0.05, 0.06), "fcf": (0.06, 0.07), "yield": (0.05, 0.03)},
+    "General": {"roic": (0.09, 0.07), "margin": (0.10, 0.08), "growth": (0.05, 0.08), "fcf": (0.07, 0.08), "yield": (0.05, 0.03)},
+}
+
+
+def _cdf_percentile(x, center, scale):
+    if x is None or scale <= 0:
+        return None
+    z = (x - center) / scale
+    return 100.0 * 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def _industry_percentile(sector, roic, margin, growth, fcf_margin, yield_metric):
+    b = SECTOR_BENCHMARKS.get(sector, SECTOR_BENCHMARKS["General"])
+    values = []
+    for key, x in (
+        ("roic", roic),
+        ("margin", margin),
+        ("growth", growth),
+        ("fcf", fcf_margin),
+        ("yield", yield_metric),
+    ):
+        if x is None:
+            continue
+        center, scale = b[key]
+        p = _cdf_percentile(x, center, scale)
+        if p is not None:
+            values.append(_clamp(p, 1, 99))
+    return round(sum(values) / len(values), 1) if values else None
+
+
+def _compute_lfs(series, tax_rate, price=None, shares=None, current=None, industry=None):
     clean = [
-        r for r in sorted(series, key=lambda x: x["year"])
+        dict(r) for r in sorted(series, key=lambda x: x["year"])
         if r.get("revenue") is not None and r.get("operating_income") is not None
-    ][-5:]
+    ][-6:]
     if len(clean) < 2:
         raise RuntimeError("LFS 계산에 필요한 연간 재무 데이터가 부족합니다.")
 
-    # 먼저 손익/현금흐름/투하자본 원자료를 만든다.
-    for r in clean:
-        r["operating_margin"] = (
-            r["operating_income"] / r["revenue"] if r.get("revenue") else None
+    def enrich(row, prev_ic=None):
+        row["operating_margin"] = (
+            row["operating_income"] / row["revenue"] if row.get("revenue") else None
         )
-        r["nopat"] = (
-            r["operating_income"] * (1 - tax_rate)
-            if r.get("operating_income") is not None else None
+        row["nopat"] = (
+            row["operating_income"] * (1 - tax_rate)
+            if row.get("operating_income") is not None else None
         )
-        if r.get("equity") is not None and r.get("debt") is not None and r.get("cash") is not None:
-            r["invested_capital"] = r["equity"] + r["debt"] - r["cash"]
-        elif r.get("assets") is not None and r.get("cash") is not None:
-            r["invested_capital"] = r["assets"] - r["cash"]
+        if row.get("equity") is not None and row.get("debt") is not None and row.get("cash") is not None:
+            row["invested_capital"] = row["equity"] + row["debt"] - row["cash"]
+        elif row.get("assets") is not None and row.get("cash") is not None:
+            row["invested_capital"] = row["assets"] - row["cash"]
         else:
-            r["invested_capital"] = None
-        r["fcf"] = (
-            r["cfo"] - r["capex"]
-            if r.get("cfo") is not None and r.get("capex") is not None else None
+            row["invested_capital"] = None
+        row["fcf"] = (
+            row["cfo"] - row["capex"]
+            if row.get("cfo") is not None and row.get("capex") is not None else None
         )
-
-    # ROIC는 기말 투하자본이 아니라 전기/당기 평균 투하자본을 우선 사용한다.
-    for i, r in enumerate(clean):
-        ic = r.get("invested_capital")
-        prev_ic = clean[i - 1].get("invested_capital") if i > 0 else None
+        ic = row.get("invested_capital")
         avg_ic = None
         if ic is not None and prev_ic is not None and ic > 0 and prev_ic > 0:
             avg_ic = (ic + prev_ic) / 2
         elif ic is not None and ic > 0:
             avg_ic = ic
-        r["roic_proxy"] = (
-            r["nopat"] / avg_ic
-            if r.get("nopat") is not None and avg_ic else None
+        row["roic_proxy"] = (
+            row["nopat"] / avg_ic
+            if row.get("nopat") is not None and avg_ic else None
         )
+        return row
 
-    latest = clean[-1]
-    roics = [r.get("roic_proxy") for r in clean if r.get("roic_proxy") is not None]
-    median_roic = _median(roics)
-    roic = latest.get("roic_proxy")
+    prev_ic = None
+    for r in clean:
+        enrich(r, prev_ic)
+        prev_ic = r.get("invested_capital")
 
-    # 1년 증분은 경기민감주에서 지나치게 노이즈가 크므로 3년 증분을 우선한다.
-    base_idx = -4 if len(clean) >= 4 else -2
-    base = clean[base_idx]
-    iroic = None
-    if latest.get("invested_capital") is not None and base.get("invested_capital") is not None:
-        delta_ic = latest["invested_capital"] - base["invested_capital"]
-        delta_nopat = (latest.get("nopat") or 0) - (base.get("nopat") or 0)
-        if abs(delta_ic) > 1:
-            iroic = delta_nopat / delta_ic
+    latest_annual = clean[-1]
+    current_row = dict(current) if current else dict(latest_annual)
+    enrich(current_row, latest_annual.get("invested_capital"))
 
+    annual_roics = [r.get("roic_proxy") for r in clean if r.get("roic_proxy") is not None]
+    median_roic = _median(annual_roics)
+    current_roic = current_row.get("roic_proxy")
+
+    rolling_iroics = []
+    for i in range(3, len(clean)):
+        a = clean[i - 3]
+        b = clean[i]
+        aic = a.get("invested_capital")
+        bic = b.get("invested_capital")
+        if aic is None or bic is None or not aic:
+            continue
+        delta_ic = bic - aic
+        min_den = max(1.0, abs(aic) * 0.02)
+        if abs(delta_ic) < min_den:
+            continue
+        delta_nopat = (b.get("nopat") or 0) - (a.get("nopat") or 0)
+        rolling_iroics.append(delta_nopat / delta_ic)
+    rolling_iroic = _median(rolling_iroics)
+
+    first = clean[0]
     rev_cagr = _cagr(
-        clean[0].get("revenue"),
-        latest.get("revenue"),
-        latest["year"] - clean[0]["year"],
+        first.get("revenue"),
+        latest_annual.get("revenue"),
+        latest_annual["year"] - first["year"],
     )
     recent_rev_cagr = None
     if len(clean) >= 4:
         recent_rev_cagr = _cagr(
             clean[-4].get("revenue"),
-            latest.get("revenue"),
-            latest["year"] - clean[-4]["year"],
+            latest_annual.get("revenue"),
+            latest_annual["year"] - clean[-4]["year"],
         )
 
     nopat_cagr = _cagr(
-        clean[0].get("nopat"),
-        latest.get("nopat"),
-        latest["year"] - clean[0]["year"],
+        first.get("nopat"),
+        latest_annual.get("nopat"),
+        latest_annual["year"] - first["year"],
     )
 
-    cash_conversions = []
-    fcf_margins = []
+    annual_cash_conversions = []
+    annual_fcf_margins = []
     positive_fcf_years = 0
+    margins = []
     for r in clean:
+        if r.get("operating_margin") is not None:
+            margins.append(r["operating_margin"])
         if r.get("cfo") is not None and r.get("net_income") is not None and r["net_income"] > 0:
-            cash_conversions.append(r["cfo"] / r["net_income"])
+            annual_cash_conversions.append(r["cfo"] / r["net_income"])
         if r.get("fcf") is not None and r.get("revenue"):
-            fcf_margins.append(r["fcf"] / r["revenue"])
+            annual_fcf_margins.append(r["fcf"] / r["revenue"])
             if r["fcf"] > 0:
                 positive_fcf_years += 1
 
-    cash_conversion = _median(cash_conversions)
-    fcf_margin = _median(fcf_margins)
-
-    margins = [r.get("operating_margin") for r in clean if r.get("operating_margin") is not None]
     normalized_margin = _median(margins)
     margin_std = _stdev(margins)
-    margin_gap = (
-        latest.get("operating_margin") - normalized_margin
-        if latest.get("operating_margin") is not None and normalized_margin is not None
-        else None
+    median_cash_conversion = _median(annual_cash_conversions)
+    normalized_fcf_margin = _median(annual_fcf_margins)
+
+    current_margin = current_row.get("operating_margin")
+    current_cash_conversion = (
+        current_row["cfo"] / current_row["net_income"]
+        if current_row.get("cfo") is not None
+        and current_row.get("net_income") is not None
+        and current_row["net_income"] > 0 else None
+    )
+    current_fcf_margin = (
+        current_row["fcf"] / current_row["revenue"]
+        if current_row.get("fcf") is not None and current_row.get("revenue") else None
     )
 
-    # 1) Economic quality proxy (15)
-    # '해자'를 재무수치만으로 확정할 수 없으므로 경제적 질 proxy로 명시한다.
-    quality_margin = _score_linear(normalized_margin, 0.00, 0.25, 5)
-    quality_roic = _score_linear(median_roic, 0.00, 0.20, 5)
-    quality_stability = (
-        2.5 if margin_std is None
-        else _score_linear(0.15 - margin_std, 0.00, 0.15, 5)
-    )
-    economic_quality = quality_margin + quality_roic + quality_stability
-
-    # 2) Capital efficiency (20)
-    capital = (
-        _score_linear(median_roic, 0.00, 0.20, 10)
-        + _score_linear(roic, 0.00, 0.20, 5)
-        + _score_linear(iroic, 0.00, 0.30, 5)
-    )
-
-    # 3) Growth / reinvestment proxy (15)
-    growth = (
-        _score_linear(rev_cagr, -0.05, 0.15, 8)
-        + _score_linear(recent_rev_cagr, -0.05, 0.20, 4)
-        + _score_linear(nopat_cagr, -0.10, 0.20, 3)
-    )
-
-    # 4) Cash quality (15): 단일연도 대신 5년 중앙값 + FCF 지속성
-    cash_quality = (
-        _score_linear(cash_conversion, 0.50, 1.50, 6)
-        + _score_linear(fcf_margin, -0.05, 0.20, 5)
-        + (positive_fcf_years / max(1, len(clean))) * 4
-    )
-
-    # 5) Financial strength (10)
+    balance = current_row
     cash_assets = (
-        latest["cash"] / latest["assets"]
-        if latest.get("assets") and latest.get("cash") is not None else None
+        balance["cash"] / balance["assets"]
+        if balance.get("assets") and balance.get("cash") is not None else None
     )
     equity_assets = (
-        latest["equity"] / latest["assets"]
-        if latest.get("assets") and latest.get("equity") is not None else None
+        balance["equity"] / balance["assets"]
+        if balance.get("assets") and balance.get("equity") is not None else None
     )
     net_cash_assets = None
-    if latest.get("assets") and latest.get("cash") is not None:
-        debt = latest.get("debt") or 0
-        net_cash_assets = (latest["cash"] - debt) / latest["assets"]
+    if balance.get("assets") and balance.get("cash") is not None:
+        debt = balance.get("debt") or 0
+        net_cash_assets = (balance["cash"] - debt) / balance["assets"]
+
+    margin_gap = (
+        current_margin - normalized_margin
+        if current_margin is not None and normalized_margin is not None else None
+    )
+
+    roic_persistent_years = sum(1 for x in annual_roics if x > 0.05)
+    roic_persistence = (roic_persistent_years / max(1, len(annual_roics))) * 5
+    margin_persistence = (
+        1.5 if margin_std is None
+        else _score_linear(0.15 - margin_std, 0.00, 0.15, 3)
+    )
+    gap_abs = abs(margin_gap) if margin_gap is not None else 0.10
+    normalization_component = _score_linear(0.20 - gap_abs, 0.00, 0.20, 2)
+    persistence_score = roic_persistence + margin_persistence + normalization_component
 
     financial = (
         _score_linear(net_cash_assets, -0.20, 0.20, 5)
         + _score_linear(equity_assets, 0.20, 0.70, 5)
     )
 
-    # 6) Persistence / normalization (10)
-    # 단순 '영업이익 양수'가 아니라 ROIC 지속성과 마진 변동성을 함께 본다.
-    roic_persistent_years = sum(1 for x in roics if x > 0.05)
-    roic_persistence = (roic_persistent_years / max(1, len(roics))) * 5
-    margin_persistence = (
-        1.5 if margin_std is None
-        else _score_linear(0.15 - margin_std, 0.00, 0.15, 3)
-    )
-    gap_abs = abs(margin_gap) if margin_gap is not None else 0.10
-    normalization = _score_linear(0.20 - gap_abs, 0.00, 0.20, 2)
-    persistence_score = roic_persistence + margin_persistence + normalization
-
-    # 7) Valuation (15): 2% 미만을 즉시 0점 처리하는 절벽을 제거한다.
-    market_cap = price * shares if price and shares else None
-    normalized_nopat = (
-        latest["revenue"] * normalized_margin * (1 - tax_rate)
-        if latest.get("revenue") and normalized_margin is not None else None
-    )
-    normalized_yield = (
-        normalized_nopat / market_cap
-        if normalized_nopat is not None and market_cap and market_cap > 0
-        else None
-    )
-    current_fcf_yield = (
-        latest.get("fcf") / market_cap
-        if latest.get("fcf") is not None and market_cap and market_cap > 0
-        else None
-    )
-    valuation = (
-        _score_linear(normalized_yield, 0.005, 0.065, 8)
-        + _score_linear(current_fcf_yield, 0.00, 0.08, 7)
+    growth_score = (
+        _score_linear(rev_cagr, -0.05, 0.15, 8)
+        + _score_linear(recent_rev_cagr, -0.05, 0.20, 4)
+        + _score_linear(nopat_cagr, -0.10, 0.20, 3)
     )
 
-    components = {
-        "economic_quality_proxy": round(economic_quality, 2),
-        "capital_efficiency": round(capital, 2),
-        "growth_reinvestment_proxy": round(growth, 2),
-        "cash_quality": round(cash_quality, 2),
+    normalized_quality = (
+        _score_linear(normalized_margin, 0.00, 0.25, 5)
+        + _score_linear(median_roic, 0.00, 0.20, 5)
+        + (2.5 if margin_std is None else _score_linear(0.15 - margin_std, 0.00, 0.15, 5))
+    )
+    current_quality = (
+        _score_linear(current_margin, 0.00, 0.30, 5)
+        + _score_linear(current_roic, 0.00, 0.25, 5)
+        + (2.5 if margin_std is None else _score_linear(0.15 - margin_std, 0.00, 0.15, 5))
+    )
+
+    normalized_capital = (
+        _score_linear(median_roic, 0.00, 0.20, 14)
+        + _score_linear(rolling_iroic, 0.00, 0.30, 6)
+    )
+    current_capital = (
+        _score_linear(current_roic, 0.00, 0.25, 14)
+        + _score_linear(rolling_iroic, 0.00, 0.30, 6)
+    )
+
+    normalized_cash_quality = (
+        _score_linear(median_cash_conversion, 0.50, 1.50, 6)
+        + _score_linear(normalized_fcf_margin, -0.05, 0.20, 5)
+        + (positive_fcf_years / max(1, len(clean))) * 4
+    )
+    current_cash_quality = (
+        _score_linear(current_cash_conversion, 0.50, 1.50, 6)
+        + _score_linear(current_fcf_margin, -0.05, 0.25, 5)
+        + (positive_fcf_years / max(1, len(clean))) * 4
+    )
+
+    current_components = {
+        "economic_quality_proxy": round(current_quality, 2),
+        "capital_efficiency": round(current_capital, 2),
+        "growth_reinvestment_proxy": round(growth_score, 2),
+        "cash_quality": round(current_cash_quality, 2),
         "financial_strength": round(financial, 2),
         "persistence_normalization": round(persistence_score, 2),
-        "valuation": round(valuation, 2),
     }
-    quality_score = round(sum(v for k, v in components.items() if k != "valuation"), 1)
-    total = round(quality_score + components["valuation"], 1)
+    normalized_components = {
+        "economic_quality_proxy": round(normalized_quality, 2),
+        "capital_efficiency": round(normalized_capital, 2),
+        "growth_reinvestment_proxy": round(growth_score, 2),
+        "cash_quality": round(normalized_cash_quality, 2),
+        "financial_strength": round(financial, 2),
+        "persistence_normalization": round(persistence_score, 2),
+    }
+
+    market_cap = price * shares if price and shares else None
+    revenue_scale = current_row.get("revenue") or latest_annual.get("revenue")
+
+    current_nopat_yield = (
+        current_row.get("nopat") / market_cap
+        if current_row.get("nopat") is not None and market_cap and market_cap > 0 else None
+    )
+    current_fcf_yield = (
+        current_row.get("fcf") / market_cap
+        if current_row.get("fcf") is not None and market_cap and market_cap > 0 else None
+    )
+    normalized_nopat = (
+        revenue_scale * normalized_margin * (1 - tax_rate)
+        if revenue_scale and normalized_margin is not None else None
+    )
+    normalized_fcf = (
+        revenue_scale * normalized_fcf_margin
+        if revenue_scale and normalized_fcf_margin is not None else None
+    )
+    normalized_nopat_yield = (
+        normalized_nopat / market_cap
+        if normalized_nopat is not None and market_cap and market_cap > 0 else None
+    )
+    normalized_fcf_yield = (
+        normalized_fcf / market_cap
+        if normalized_fcf is not None and market_cap and market_cap > 0 else None
+    )
+
+    current_valuation = (
+        _score_linear(current_nopat_yield, 0.005, 0.09, 8)
+        + _score_linear(current_fcf_yield, 0.00, 0.10, 7)
+    )
+    normalized_valuation = (
+        _score_linear(normalized_nopat_yield, 0.005, 0.07, 8)
+        + _score_linear(normalized_fcf_yield, 0.00, 0.08, 7)
+    )
+
+    current_quality_score = round(sum(current_components.values()), 1)
+    normalized_quality_score = round(sum(normalized_components.values()), 1)
+    current_score = round(current_quality_score + current_valuation, 1)
+    normalized_score = round(normalized_quality_score + normalized_valuation, 1)
+    blended_score = round(0.4 * current_score + 0.6 * normalized_score, 1)
+
+    sector = (industry or {}).get("sector") or "General"
+    industry_percentile_current = _industry_percentile(
+        sector,
+        current_roic,
+        current_margin,
+        recent_rev_cagr if recent_rev_cagr is not None else rev_cagr,
+        current_fcf_margin,
+        current_nopat_yield,
+    )
+    industry_percentile_normalized = _industry_percentile(
+        sector,
+        median_roic,
+        normalized_margin,
+        rev_cagr,
+        normalized_fcf_margin,
+        normalized_nopat_yield,
+    )
+    if industry_percentile_current is not None and industry_percentile_normalized is not None:
+        industry_percentile = round(
+            0.4 * industry_percentile_current + 0.6 * industry_percentile_normalized, 1
+        )
+    else:
+        industry_percentile = industry_percentile_normalized or industry_percentile_current
 
     return {
-        "score": total,
-        "quality_score": quality_score,
-        "valuation_score": round(components["valuation"], 1),
-        "components": components,
+        "score": blended_score,
+        "current_score": current_score,
+        "normalized_score": normalized_score,
+        "current_quality_score": current_quality_score,
+        "normalized_quality_score": normalized_quality_score,
+        "current_valuation_score": round(current_valuation, 1),
+        "normalized_valuation_score": round(normalized_valuation, 1),
+        "current_components": current_components,
+        "normalized_components": normalized_components,
+        "components": normalized_components,
+        "industry_percentile": industry_percentile,
+        "industry_percentile_current": industry_percentile_current,
+        "industry_percentile_normalized": industry_percentile_normalized,
+        "industry": industry or {"sector": "General"},
         "metrics": {
-            "latest_year": latest["year"],
-            "roic_proxy": roic,
+            "latest_year": latest_annual["year"],
+            "basis": current_row.get("basis") or f"FY {latest_annual['year']}",
+            "roic_proxy": current_roic,
             "median_roic_proxy": median_roic,
-            "incremental_roic_proxy": iroic,
+            "rolling_3y_incremental_roic_median": rolling_iroic,
+            "rolling_3y_incremental_roic_observations": len(rolling_iroics),
             "revenue_cagr": rev_cagr,
             "recent_revenue_cagr": recent_rev_cagr,
             "nopat_cagr": nopat_cagr,
-            "cash_conversion": cash_conversion,
-            "fcf_margin": fcf_margin,
-            "operating_margin": latest.get("operating_margin"),
+            "cash_conversion": current_cash_conversion,
+            "median_cash_conversion": median_cash_conversion,
+            "fcf_margin": current_fcf_margin,
+            "normalized_fcf_margin": normalized_fcf_margin,
+            "operating_margin": current_margin,
             "normalized_operating_margin": normalized_margin,
             "margin_gap": margin_gap,
             "cash_to_assets": cash_assets,
             "net_cash_to_assets": net_cash_assets,
             "equity_to_assets": equity_assets,
             "market_cap_approx": market_cap,
-            "normalized_nopat_yield": normalized_yield,
+            "current_nopat_yield": current_nopat_yield,
             "current_fcf_yield": current_fcf_yield,
+            "normalized_nopat_yield": normalized_nopat_yield,
+            "normalized_fcf_yield": normalized_fcf_yield,
         },
         "history": clean,
+        "current_data": current_row,
         "methodology": {
-            "version": "pilot-0.2",
-            "note": "업종 percentile 전의 절대기준 파일럿입니다. 경제적 해자는 재무수치만으로 확정하지 않고 economic quality proxy로 표시합니다. 현재 점수는 최근 연간 공시 기준이며 TTM은 다음 단계에서 반영합니다.",
+            "version": "pilot-0.3",
+            "main_score": "40% current + 60% normalized",
+            "industry_percentile_method": "sector-adjusted parametric benchmark; not yet a live peer cross-section",
+            "note": "TTM이 가능하면 현재점수는 TTM을 사용하고, 정상화점수는 최근 연간 분포의 중앙값/지속성을 사용합니다. 업종 percentile은 무료 즉시조회 버전의 섹터 benchmark CDF입니다.",
         },
     }
 
 
+def _kr_interim_target(now=None):
+    now = now or datetime.utcnow()
+    if now.month >= 11:
+        return now.year, "11014", "Q3"
+    if now.month >= 8:
+        return now.year, "11012", "H1"
+    if now.month >= 5:
+        return now.year, "11013", "Q1"
+    return None, None, None
+
+
 def analyze_kr(q):
     company = _resolve_kr_company(q)
-    latest_year = datetime.utcnow().year - 1
+    now = datetime.utcnow()
+    latest_year = now.year - 1
+    annual_years = [latest_year, latest_year - 3, latest_year - 6]
+    interim_year, interim_code, interim_label = _kr_interim_target(now)
 
-    # 연간 공시 1건에는 당기/전기/전전기 값이 같이 들어온다.
-    # 따라서 최신연도와 3년 전 공시만 가져오면 최대 6개 연도를 만들 수 있다.
-    requested_years = [latest_year, latest_year - 3]
-    raw_sets = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        annual_jobs = {
+            ex.submit(_dart_annual_rows, company["corp_code"], y): y for y in annual_years
+        }
+        interim_job = (
+            ex.submit(_dart_statement_rows, company["corp_code"], interim_year, interim_code)
+            if interim_code else None
+        )
+        info_job = ex.submit(_dart_company_info, company["corp_code"])
+        price_job = ex.submit(_kr_price, company["stock_code"]) if company["stock_code"] else None
+        share_job = ex.submit(
+            _dart_share_count,
+            company["corp_code"],
+            interim_year if interim_code else latest_year,
+            interim_code if interim_code else "11011",
+        )
 
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        jobs = {ex.submit(_dart_annual_rows, company["corp_code"], y): y for y in requested_years}
-        for future in as_completed(jobs):
-            y = jobs[future]
+        raw_sets = {}
+        for future, y in [(f, y) for f, y in annual_jobs.items()]:
             try:
-                raw, fs_div = future.result()
+                raw, fs_div = future.result(timeout=8)
             except Exception:
                 raw, fs_div = None, None
             if raw:
                 raw_sets[y] = (raw, fs_div)
 
+        try:
+            interim_rows, interim_fs = interim_job.result(timeout=8) if interim_job else (None, None)
+        except Exception:
+            interim_rows, interim_fs = None, None
+        try:
+            company_info = info_job.result(timeout=6) or {}
+        except Exception:
+            company_info = {}
+        try:
+            p = price_job.result(timeout=7) if price_job else None
+        except Exception:
+            p = None
+        try:
+            shares = share_job.result(timeout=7)
+        except Exception:
+            shares = None
+
     rows_by_year = {}
     fs_used = {}
-
-    for report_year, payload in raw_sets.items():
-        raw, fs_div = payload
+    for report_year in sorted(raw_sets.keys(), reverse=True):
+        raw, fs_div = raw_sets[report_year]
         for offset, amount_key in (
             (0, "thstrm_amount"),
             (1, "frmtrm_amount"),
@@ -850,58 +1238,53 @@ def analyze_kr(q):
             y = report_year - offset
             if y in rows_by_year:
                 continue
-            m = _dart_metrics_from_rows(raw, amount_key=amount_key)
-            # 핵심 손익 값이 둘 다 있어야 유효한 연도로 본다.
+            m = _dart_metrics_from_rows(raw, flow_key=amount_key, balance_key=amount_key)
             if m.get("revenue") is None or m.get("operating_income") is None:
                 continue
             m["year"] = y
             rows_by_year[y] = m
             fs_used[y] = fs_div
 
-    rows = [rows_by_year[y] for y in sorted(rows_by_year)]
-    rows = rows[-5:]
-
+    rows = [rows_by_year[y] for y in sorted(rows_by_year)][-6:]
     if len(rows) < 2:
-        # 드물게 비교열이 비어 있는 공시가 있으면 개별 연도 조회로 보완한다.
-        fallback_years = list(range(latest_year, latest_year - 6, -1))
-        for y in fallback_years:
-            if y in rows_by_year:
-                continue
-            try:
-                raw, fs_div = _dart_annual_rows(company["corp_code"], y)
-            except Exception:
-                continue
-            if raw:
-                m = _dart_metrics_from_rows(raw)
-                if m.get("revenue") is not None and m.get("operating_income") is not None:
-                    m["year"] = y
-                    rows_by_year[y] = m
-                    fs_used[y] = fs_div
-            if len(rows_by_year) >= 5:
-                break
-        rows = [rows_by_year[y] for y in sorted(rows_by_year)][-5:]
+        raise RuntimeError(
+            "OpenDART 연간 재무제표를 충분히 읽지 못했습니다. 해당 기업의 계정 구조가 표준형과 다를 수 있습니다."
+        )
 
-    if len(rows) < 2:
-        raise RuntimeError("OpenDART에서 LFS 계산에 필요한 최근 연간 재무제표를 충분히 찾지 못했습니다.")
+    annual_latest = rows[-1]
+    current = None
+    if interim_rows and interim_code:
+        current = _dart_interim_ttm(
+            annual_latest,
+            interim_rows,
+            interim_year,
+            interim_code,
+            interim_fs,
+        )
 
-    latest_data_year = rows[-1]["year"]
-
-    # 주식수와 무료 가격 데이터는 병렬 조회한다.
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        share_job = ex.submit(_dart_share_count, company["corp_code"], latest_data_year)
-        price_job = ex.submit(_kr_price, company["stock_code"]) if company["stock_code"] else None
+    if shares is None:
         try:
-            shares = share_job.result(timeout=10)
+            shares = _dart_share_count(company["corp_code"], annual_latest["year"], "11011")
         except Exception:
             shares = None
-        try:
-            p = price_job.result(timeout=8) if price_job else None
-        except Exception:
-            p = None
 
     price = p.get("price") if p else None
+    industry_code = company_info.get("induty_code")
+    sector = _sector_from_kr_industry(industry_code)
+    industry = {
+        "sector": sector,
+        "industry_code": industry_code,
+        "industry_name": company_info.get("corp_cls") or sector,
+    }
 
-    result = _compute_lfs(rows, tax_rate=0.24, price=price, shares=shares)
+    result = _compute_lfs(
+        rows,
+        tax_rate=0.24,
+        price=price,
+        shares=shares,
+        current=current,
+        industry=industry,
+    )
     result.update(
         {
             "market": "KR",
@@ -911,7 +1294,13 @@ def analyze_kr(q):
             "price": p,
             "shares_approx": shares,
             "fs_div_by_year": fs_used,
-            "sources": ["OpenDART", "Yahoo Finance chart endpoint (price fallback)"],
+            "interim_report": {
+                "year": interim_year,
+                "code": interim_code,
+                "label": interim_label,
+                "used_for_ttm": bool(current),
+            },
+            "sources": ["OpenDART", "SEC-style sector benchmark logic", "Yahoo Finance chart endpoint (price fallback)"],
         }
     )
     return result
@@ -919,14 +1308,46 @@ def analyze_kr(q):
 
 def analyze_us(q):
     company = _sec_company(q)
-    cf = _sec_companyfacts(company["cik"])
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        cf_job = ex.submit(_sec_companyfacts, company["cik"])
+        sub_job = ex.submit(_sec_submissions, company["cik"])
+        price_job = ex.submit(_yahoo_price, company["ticker"])
+        cf = cf_job.result(timeout=10)
+        try:
+            submissions = sub_job.result(timeout=7)
+        except Exception:
+            submissions = {}
+        try:
+            p = price_job.result(timeout=6)
+        except Exception:
+            p = None
+
     rows = _sec_series(cf)
-    rows = [r for r in rows if r["year"] >= datetime.utcnow().year - 7]
+    rows = [r for r in rows if r["year"] >= datetime.utcnow().year - 9][-7:]
+    if len(rows) < 2:
+        raise RuntimeError("SEC Company Facts에서 충분한 연간 재무데이터를 찾지 못했습니다.")
+
+    annual_latest = rows[-1]
+    current = _sec_ttm_row(cf, annual_latest)
     shares = _sec_latest_shares(cf)
-    p = _yahoo_price(company["ticker"])
     price = p.get("price") if p else None
 
-    result = _compute_lfs(rows, tax_rate=0.21, price=price, shares=shares)
+    sic = submissions.get("sic")
+    sector = _sector_from_sic(sic)
+    industry = {
+        "sector": sector,
+        "industry_code": str(sic) if sic is not None else None,
+        "industry_name": submissions.get("sicDescription") or sector,
+    }
+
+    result = _compute_lfs(
+        rows,
+        tax_rate=0.21,
+        price=price,
+        shares=shares,
+        current=current,
+        industry=industry,
+    )
     result.update(
         {
             "market": "US",
@@ -935,7 +1356,7 @@ def analyze_us(q):
             "cik": company["cik"],
             "price": p,
             "shares_approx": shares,
-            "sources": ["SEC EDGAR Company Facts", "Yahoo Finance chart endpoint (price fallback)"],
+            "sources": ["SEC EDGAR Company Facts", "SEC submissions", "Yahoo Finance chart endpoint (price fallback)"],
         }
     )
     return result
