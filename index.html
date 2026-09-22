@@ -91,6 +91,11 @@ function num(v) {
   if (v === null || v === undefined) return "-";
   return Number(v).toLocaleString(undefined, {maximumFractionDigits:1});
 }
+function money(v, market) {
+  if (v === null || v === undefined) return "-";
+  if (market === "KR") return (v / 1e12).toFixed(1) + "조원";
+  return "$" + (v / 1e9).toFixed(1) + "B";
+}
 function addMetric(root, label, value) {
   var d = document.createElement("div");
   d.className = "metric";
@@ -143,12 +148,16 @@ document.getElementById("go").onclick = async function() {
     var sector = d.industry && d.industry.sector ? d.industry.sector : "General";
     var indName = d.industry && d.industry.industry_name ? d.industry.industry_name : sector;
     var indCode = d.industry && d.industry.industry_code ? d.industry.industry_code : "-";
-    [
-      "업종: " + indName,
+    var pills = [
       "Sector: " + sector,
-      "업종코드: " + indCode,
+      "산업코드: " + indCode,
       "업종 benchmark percentile: " + (d.industry_percentile == null ? "-" : d.industry_percentile.toFixed(1) + "%")
-    ].forEach(function(txt) {
+    ];
+    if (d.industry && d.industry.market_class) {
+      var marketNames = {Y:"KOSPI", K:"KOSDAQ", N:"KONEX", E:"기타"};
+      pills.unshift("시장: " + (marketNames[d.industry.market_class] || d.industry.market_class));
+    }
+    pills.forEach(function(txt) {
       var s = document.createElement("span");
       s.className = "pill";
       s.textContent = txt;
@@ -179,6 +188,12 @@ document.getElementById("go").onclick = async function() {
     addMetric(metrics, "Current FCF Yield", pct(d.metrics.current_fcf_yield));
     addMetric(metrics, "Normalized NOPAT Yield", pct(d.metrics.normalized_nopat_yield));
     addMetric(metrics, "Normalized FCF Yield", pct(d.metrics.normalized_fcf_yield));
+    addMetric(metrics, "TTM 매출", money(d.metrics.current_revenue, d.market));
+    addMetric(metrics, "TTM 영업이익", money(d.metrics.current_operating_income, d.market));
+    addMetric(metrics, "TTM 순이익", money(d.metrics.current_net_income, d.market));
+    addMetric(metrics, "TTM 영업현금흐름", money(d.metrics.current_cfo, d.market));
+    addMetric(metrics, "TTM CAPEX", money(d.metrics.current_capex, d.market));
+    addMetric(metrics, "TTM FCF", money(d.metrics.current_fcf, d.market));
 
     var labels = {
       economic_quality_proxy:"경제적 질 Proxy",
