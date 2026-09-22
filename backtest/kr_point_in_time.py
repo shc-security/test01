@@ -643,26 +643,49 @@ def run(args):
         asof = first_trading_day_on_or_after(marcap, year)
         cap_snapshot, _ = market_cap_snapshot(marcap, asof)
 
-        liquid = sorted(
+        # Build the point-in-time universe as the largest DART-mappable
+        # corporations, not simply the first N security codes. This prevents
+        # ETFs, preferred shares and duplicate share classes from displacing
+        # common-stock corporations from the research universe.
+        securities = sorted(
             cap_snapshot.values(),
             key=lambda x: x["market_cap"],
             reverse=True,
-        )[: args.universe_size]
+        )
 
         mapped = []
         seen_corps = set()
-        for row in liquid:
+        scanned_securities = 0
+        for row in securities:
+            scanned_securities += 1
             corp = by_stock.get(row["ticker"])
             if not corp:
-                corp = by_name.get(_normalize_corp_name(row.get("name")))
+                candidate = by_name.get(_normalize_corp_name(row.get("name")))
+                if candidate:
+                    current_common = candidate.get("stock_code")
+                    # If the corporation's common code is present on the same
+                    # historical date, a name-only alternate code is normally
+                    # a preferred/other share class and must not be ranked.
+                    if (
+                        current_common
+                        and current_common != row["ticker"]
+                        and current_common in cap_snapshot
+                    ):
+                        candidate = None
+                corp = candidate
             if not corp:
                 continue
             if corp["corp_code"] in seen_corps:
                 continue
             seen_corps.add(corp["corp_code"])
             mapped.append((row, corp))
+            if len(mapped) >= args.universe_size:
+                break
 
-        mapping_coverage = len(mapped) / len(liquid) if liquid else 0.0
+        mapping_coverage = (
+            min(1.0, len(mapped) / args.universe_size)
+            if args.universe_size > 0 else 0.0
+        )
         scored = []
         errors = []
         for idx, (cap_row, corp) in enumerate(mapped, start=1):
@@ -691,7 +714,8 @@ def run(args):
             {
                 "cohort_year": year,
                 "asof_date": asof.isoformat(),
-                "raw_liquid_universe": len(liquid),
+                "requested_corporations": args.universe_size,
+                "scanned_securities": scanned_securities,
                 "mapped_corporations": len(mapped),
                 "scored_corporations": len(scored),
                 "mapping_coverage": mapping_coverage,
