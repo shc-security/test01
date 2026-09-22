@@ -513,6 +513,7 @@ def _compute_lfs(series, tax_rate, price=None, shares=None):
     if len(clean) < 2:
         raise RuntimeError("LFS 계산에 필요한 연간 재무 데이터가 부족합니다.")
 
+    # 먼저 손익/현금흐름/투하자본 원자료를 만든다.
     for r in clean:
         r["operating_margin"] = (
             r["operating_income"] / r["revenue"] if r.get("revenue") else None
@@ -531,21 +532,33 @@ def _compute_lfs(series, tax_rate, price=None, shares=None):
             r["cfo"] - r["capex"]
             if r.get("cfo") is not None and r.get("capex") is not None else None
         )
+
+    # ROIC는 기말 투하자본이 아니라 전기/당기 평균 투하자본을 우선 사용한다.
+    for i, r in enumerate(clean):
+        ic = r.get("invested_capital")
+        prev_ic = clean[i - 1].get("invested_capital") if i > 0 else None
+        avg_ic = None
+        if ic is not None and prev_ic is not None and ic > 0 and prev_ic > 0:
+            avg_ic = (ic + prev_ic) / 2
+        elif ic is not None and ic > 0:
+            avg_ic = ic
         r["roic_proxy"] = (
-            r["nopat"] / r["invested_capital"]
-            if r.get("nopat") is not None and r.get("invested_capital")
-            and r["invested_capital"] > 0 else None
+            r["nopat"] / avg_ic
+            if r.get("nopat") is not None and avg_ic else None
         )
 
     latest = clean[-1]
-    prior = clean[-2]
-
+    roics = [r.get("roic_proxy") for r in clean if r.get("roic_proxy") is not None]
+    median_roic = _median(roics)
     roic = latest.get("roic_proxy")
-    delta_ic = None
+
+    # 1년 증분은 경기민감주에서 지나치게 노이즈가 크므로 3년 증분을 우선한다.
+    base_idx = -4 if len(clean) >= 4 else -2
+    base = clean[base_idx]
     iroic = None
-    if latest.get("invested_capital") is not None and prior.get("invested_capital") is not None:
-        delta_ic = latest["invested_capital"] - prior["invested_capital"]
-        delta_nopat = (latest.get("nopat") or 0) - (prior.get("nopat") or 0)
+    if latest.get("invested_capital") is not None and base.get("invested_capital") is not None:
+        delta_ic = latest["invested_capital"] - base["invested_capital"]
+        delta_nopat = (latest.get("nopat") or 0) - (base.get("nopat") or 0)
         if abs(delta_ic) > 1:
             iroic = delta_nopat / delta_ic
 
@@ -554,23 +567,34 @@ def _compute_lfs(series, tax_rate, price=None, shares=None):
         latest.get("revenue"),
         latest["year"] - clean[0]["year"],
     )
+    recent_rev_cagr = None
+    if len(clean) >= 4:
+        recent_rev_cagr = _cagr(
+            clean[-4].get("revenue"),
+            latest.get("revenue"),
+            latest["year"] - clean[-4]["year"],
+        )
+
     nopat_cagr = _cagr(
         clean[0].get("nopat"),
         latest.get("nopat"),
         latest["year"] - clean[0]["year"],
     )
-    cash_conversion = (
-        latest["cfo"] / latest["net_income"]
-        if latest.get("cfo") is not None
-        and latest.get("net_income") not in (None, 0)
-        and latest["net_income"] > 0
-        else None
-    )
-    fcf_margin = (
-        latest["fcf"] / latest["revenue"]
-        if latest.get("fcf") is not None and latest.get("revenue")
-        else None
-    )
+
+    cash_conversions = []
+    fcf_margins = []
+    positive_fcf_years = 0
+    for r in clean:
+        if r.get("cfo") is not None and r.get("net_income") is not None and r["net_income"] > 0:
+            cash_conversions.append(r["cfo"] / r["net_income"])
+        if r.get("fcf") is not None and r.get("revenue"):
+            fcf_margins.append(r["fcf"] / r["revenue"])
+            if r["fcf"] > 0:
+                positive_fcf_years += 1
+
+    cash_conversion = _median(cash_conversions)
+    fcf_margin = _median(fcf_margins)
+
     margins = [r.get("operating_margin") for r in clean if r.get("operating_margin") is not None]
     normalized_margin = _median(margins)
     margin_std = _stdev(margins)
@@ -580,39 +604,69 @@ def _compute_lfs(series, tax_rate, price=None, shares=None):
         else None
     )
 
-    # 1) Moat proxy: durable margin + low margin volatility.
-    moat_margin = _score_linear(normalized_margin, 0.0, 0.30, 8)
-    stability = 3.5 if margin_std is None else _score_linear(0.15 - margin_std, 0, 0.12, 7)
-    moat = moat_margin + stability
+    # 1) Economic quality proxy (15)
+    # '해자'를 재무수치만으로 확정할 수 없으므로 경제적 질 proxy로 명시한다.
+    quality_margin = _score_linear(normalized_margin, 0.00, 0.25, 5)
+    quality_roic = _score_linear(median_roic, 0.00, 0.20, 5)
+    quality_stability = (
+        2.5 if margin_std is None
+        else _score_linear(0.15 - margin_std, 0.00, 0.15, 5)
+    )
+    economic_quality = quality_margin + quality_roic + quality_stability
 
-    # 2) Capital efficiency.
-    capital = _score_linear(roic, 0.0, 0.25, 14) + _score_linear(iroic, 0.0, 0.30, 6)
+    # 2) Capital efficiency (20)
+    capital = (
+        _score_linear(median_roic, 0.00, 0.20, 10)
+        + _score_linear(roic, 0.00, 0.20, 5)
+        + _score_linear(iroic, 0.00, 0.30, 5)
+    )
 
-    # 3) Growth / reinvestment proxy.
-    growth = _score_linear(rev_cagr, -0.05, 0.20, 8) + _score_linear(nopat_cagr, -0.05, 0.25, 7)
+    # 3) Growth / reinvestment proxy (15)
+    growth = (
+        _score_linear(rev_cagr, -0.05, 0.15, 8)
+        + _score_linear(recent_rev_cagr, -0.05, 0.20, 4)
+        + _score_linear(nopat_cagr, -0.10, 0.20, 3)
+    )
 
-    # 4) Cash quality.
-    cash_quality = _score_linear(cash_conversion, 0.5, 1.5, 7) + _score_linear(fcf_margin, -0.05, 0.20, 8)
+    # 4) Cash quality (15): 단일연도 대신 5년 중앙값 + FCF 지속성
+    cash_quality = (
+        _score_linear(cash_conversion, 0.50, 1.50, 6)
+        + _score_linear(fcf_margin, -0.05, 0.20, 5)
+        + (positive_fcf_years / max(1, len(clean))) * 4
+    )
 
-    # 5) Balance-sheet resilience.
+    # 5) Financial strength (10)
+    cash_assets = (
+        latest["cash"] / latest["assets"]
+        if latest.get("assets") and latest.get("cash") is not None else None
+    )
+    equity_assets = (
+        latest["equity"] / latest["assets"]
+        if latest.get("assets") and latest.get("equity") is not None else None
+    )
+    net_cash_assets = None
     if latest.get("assets") and latest.get("cash") is not None:
-        cash_assets = latest["cash"] / latest["assets"]
-    else:
-        cash_assets = None
-    if latest.get("assets") and latest.get("equity") is not None:
-        equity_assets = latest["equity"] / latest["assets"]
-    else:
-        equity_assets = None
-    financial = _score_linear(cash_assets, 0.02, 0.25, 5) + _score_linear(equity_assets, 0.20, 0.70, 5)
+        debt = latest.get("debt") or 0
+        net_cash_assets = (latest["cash"] - debt) / latest["assets"]
 
-    # 6) Persistence / normalization.
-    positive_years = sum(1 for m in margins if m > 0)
-    persistence = (positive_years / max(1, len(margins))) * 5
-    gap_abs = abs(margin_gap) if margin_gap is not None else 0.05
-    normalization = _score_linear(0.25 - gap_abs, 0.0, 0.25, 5)
-    persistence_score = persistence + normalization
+    financial = (
+        _score_linear(net_cash_assets, -0.20, 0.20, 5)
+        + _score_linear(equity_assets, 0.20, 0.70, 5)
+    )
 
-    # 7) Valuation: normalized NOPAT yield on approximate market cap.
+    # 6) Persistence / normalization (10)
+    # 단순 '영업이익 양수'가 아니라 ROIC 지속성과 마진 변동성을 함께 본다.
+    roic_persistent_years = sum(1 for x in roics if x > 0.05)
+    roic_persistence = (roic_persistent_years / max(1, len(roics))) * 5
+    margin_persistence = (
+        1.5 if margin_std is None
+        else _score_linear(0.15 - margin_std, 0.00, 0.15, 3)
+    )
+    gap_abs = abs(margin_gap) if margin_gap is not None else 0.10
+    normalization = _score_linear(0.20 - gap_abs, 0.00, 0.20, 2)
+    persistence_score = roic_persistence + margin_persistence + normalization
+
+    # 7) Valuation (15): 2% 미만을 즉시 0점 처리하는 절벽을 제거한다.
     market_cap = price * shares if price and shares else None
     normalized_nopat = (
         latest["revenue"] * normalized_margin * (1 - tax_rate)
@@ -623,10 +677,18 @@ def _compute_lfs(series, tax_rate, price=None, shares=None):
         if normalized_nopat is not None and market_cap and market_cap > 0
         else None
     )
-    valuation = _score_linear(normalized_yield, 0.02, 0.08, 15)
+    current_fcf_yield = (
+        latest.get("fcf") / market_cap
+        if latest.get("fcf") is not None and market_cap and market_cap > 0
+        else None
+    )
+    valuation = (
+        _score_linear(normalized_yield, 0.005, 0.065, 8)
+        + _score_linear(current_fcf_yield, 0.00, 0.08, 7)
+    )
 
     components = {
-        "moat_proxy": round(moat, 2),
+        "economic_quality_proxy": round(economic_quality, 2),
         "capital_efficiency": round(capital, 2),
         "growth_reinvestment_proxy": round(growth, 2),
         "cash_quality": round(cash_quality, 2),
@@ -634,16 +696,21 @@ def _compute_lfs(series, tax_rate, price=None, shares=None):
         "persistence_normalization": round(persistence_score, 2),
         "valuation": round(valuation, 2),
     }
-    total = round(sum(components.values()), 1)
+    quality_score = round(sum(v for k, v in components.items() if k != "valuation"), 1)
+    total = round(quality_score + components["valuation"], 1)
 
     return {
         "score": total,
+        "quality_score": quality_score,
+        "valuation_score": round(components["valuation"], 1),
         "components": components,
         "metrics": {
             "latest_year": latest["year"],
             "roic_proxy": roic,
+            "median_roic_proxy": median_roic,
             "incremental_roic_proxy": iroic,
             "revenue_cagr": rev_cagr,
+            "recent_revenue_cagr": recent_rev_cagr,
             "nopat_cagr": nopat_cagr,
             "cash_conversion": cash_conversion,
             "fcf_margin": fcf_margin,
@@ -651,14 +718,16 @@ def _compute_lfs(series, tax_rate, price=None, shares=None):
             "normalized_operating_margin": normalized_margin,
             "margin_gap": margin_gap,
             "cash_to_assets": cash_assets,
+            "net_cash_to_assets": net_cash_assets,
             "equity_to_assets": equity_assets,
             "market_cap_approx": market_cap,
             "normalized_nopat_yield": normalized_yield,
+            "current_fcf_yield": current_fcf_yield,
         },
         "history": clean,
         "methodology": {
-            "version": "pilot-0.1",
-            "note": "현재 버전은 업종 percentile 정규화 전의 파일럿 LFS입니다. ROIC는 공시 항목 가용성에 따라 capital-employed proxy를 사용할 수 있습니다.",
+            "version": "pilot-0.2",
+            "note": "업종 percentile 전의 절대기준 파일럿입니다. 경제적 해자는 재무수치만으로 확정하지 않고 economic quality proxy로 표시합니다. 현재 점수는 최근 연간 공시 기준이며 TTM은 다음 단계에서 반영합니다.",
         },
     }
 
