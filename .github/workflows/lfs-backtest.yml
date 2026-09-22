@@ -1,0 +1,106 @@
+name: LFS point-in-time backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_year:
+        description: "First ranking year"
+        required: true
+        default: "2016"
+      end_year:
+        description: "Last ranking year"
+        required: true
+        default: "2025"
+      universe_size:
+        description: "Point-in-time liquid universe size"
+        required: true
+        default: "100"
+  push:
+    branches: [master]
+    paths:
+      - "backtest/**"
+      - ".github/workflows/lfs-backtest.yml"
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r backtest/requirements.txt
+      - run: pytest -q backtest/test_core.py
+
+  smoke:
+    if: github.event_name == 'push'
+    needs: unit
+    runs-on: ubuntu-latest
+    env:
+      DART_API_KEY: ${{ secrets.DART_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r backtest/requirements.txt
+      - name: Check DART secret
+        id: dart
+        shell: bash
+        run: |
+          if [ -z "$DART_API_KEY" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "DART_API_KEY GitHub Actions secret is not configured; data smoke test skipped."
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: One-cohort data smoke test
+        if: steps.dart.outputs.present == 'true'
+        run: python backtest/kr_point_in_time.py --start-year 2024 --end-year 2024 --universe-size 20 --top-n 10 --min-mapping-coverage 0.85 --min-score-coverage 0.60
+      - uses: actions/upload-artifact@v4
+        if: steps.dart.outputs.present == 'true'
+        with:
+          name: lfs-backtest-smoke
+          path: backtest/out/
+          retention-days: 14
+
+  full:
+    if: github.event_name == 'workflow_dispatch'
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      DART_API_KEY: ${{ secrets.DART_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r backtest/requirements.txt
+      - name: Require DART key
+        shell: bash
+        run: |
+          if [ -z "$DART_API_KEY" ]; then
+            echo "::error::Add DART_API_KEY to GitHub Actions repository secrets before running the full backtest."
+            exit 1
+          fi
+      - uses: actions/cache@v4
+        with:
+          path: backtest/.cache
+          key: lfs-pit-dart-v1-${{ inputs.start_year }}-${{ inputs.end_year }}
+          restore-keys: |
+            lfs-pit-dart-v1-
+      - name: Run point-in-time backtest
+        run: >-
+          python backtest/kr_point_in_time.py
+          --start-year ${{ inputs.start_year }}
+          --end-year ${{ inputs.end_year }}
+          --universe-size ${{ inputs.universe_size }}
+          --top-n 10
+          --min-mapping-coverage 0.95
+          --min-score-coverage 0.80
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lfs-point-in-time-results
+          path: backtest/out/
+          retention-days: 90
