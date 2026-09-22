@@ -2290,6 +2290,16 @@ def analyze_us(q):
         "industry_name": submissions.get("sicDescription") if submissions else sector,
     }
 
+    balance_for_ev = current or rows[-1]
+    equity_market_cap = price * shares if price and shares else None
+    debt_now = balance_for_ev.get("debt") if balance_for_ev else None
+    cash_now = balance_for_ev.get("cash") if balance_for_ev else None
+    enterprise_value = (
+        equity_market_cap + debt_now - cash_now
+        if equity_market_cap and debt_now is not None and cash_now is not None
+        else None
+    )
+
     result = _compute_lfs(
         rows,
         tax_rate=0.21,
@@ -2297,7 +2307,20 @@ def analyze_us(q):
         shares=shares,
         current=current,
         industry=industry,
+        equity_market_cap=equity_market_cap,
+        enterprise_value=enterprise_value,
     )
+
+    peer_target = {
+        "roic": result["metrics"].get("roic_proxy"),
+        "margin": result["metrics"].get("operating_margin"),
+        "growth": result["metrics"].get("recent_revenue_cagr") or result["metrics"].get("revenue_cagr"),
+        "fcf_margin": result["metrics"].get("fcf_margin"),
+    }
+    peer_relative = _actual_peer_relative_score(ticker, peer_target, 0.21)
+    if peer_relative:
+        result["industry_percentile"] = peer_relative["score"]
+        result["peer_relative"] = peer_relative
     result.update(
         {
             "market": "US",
@@ -2306,6 +2329,8 @@ def analyze_us(q):
             "cik": company["cik"],
             "price": p,
             "shares_approx": shares,
+            "equity_market_cap": equity_market_cap,
+            "enterprise_value": enterprise_value,
             "us_data_source": source_mode,
             "sec_fallback_reason": sec_error if source_mode != "SEC EDGAR" else None,
             "sources": (
