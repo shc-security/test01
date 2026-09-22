@@ -1552,7 +1552,16 @@ def _industry_percentile(sector, roic, margin, growth, fcf_margin, yield_metric)
     return round(sum(values) / len(values), 1) if values else None
 
 
-def _compute_lfs(series, tax_rate, price=None, shares=None, current=None, industry=None):
+def _compute_lfs(
+    series,
+    tax_rate,
+    price=None,
+    shares=None,
+    current=None,
+    industry=None,
+    equity_market_cap=None,
+    enterprise_value=None,
+):
     clean = [
         dict(r) for r in sorted(series, key=lambda x: x["year"])
         if r.get("revenue") is not None and r.get("operating_income") is not None
@@ -1767,13 +1776,26 @@ def _compute_lfs(series, tax_rate, price=None, shares=None, current=None, indust
         "persistence_normalization": round(persistence_score, 2),
     }
 
-    market_cap = price * shares if price and shares else None
+    market_cap = equity_market_cap
+    if market_cap is None:
+        market_cap = price * shares if price and shares else None
+
+    ev = enterprise_value
+    if ev is None and market_cap and market_cap > 0:
+        debt_now = current_row.get("debt")
+        cash_now = current_row.get("cash")
+        if debt_now is not None and cash_now is not None:
+            ev = market_cap + debt_now - cash_now
+
     revenue_scale = current_row.get("revenue") or latest_annual.get("revenue")
 
+    # NOPAT is an operating-profit measure available to all capital providers,
+    # so value it against enterprise value rather than equity market cap.
     current_nopat_yield = (
-        current_row.get("nopat") / market_cap
-        if current_row.get("nopat") is not None and market_cap and market_cap > 0 else None
+        current_row.get("nopat") / ev
+        if current_row.get("nopat") is not None and ev and ev > 0 else None
     )
+    # CFO - capex is retained as an equity-oriented cash proxy in this model.
     current_fcf_yield = (
         current_row.get("fcf") / market_cap
         if current_row.get("fcf") is not None and market_cap and market_cap > 0 else None
@@ -1787,15 +1809,18 @@ def _compute_lfs(series, tax_rate, price=None, shares=None, current=None, indust
         if revenue_scale and normalized_fcf_margin is not None else None
     )
     normalized_nopat_yield = (
-        normalized_nopat / market_cap
-        if normalized_nopat is not None and market_cap and market_cap > 0 else None
+        normalized_nopat / ev
+        if normalized_nopat is not None and ev and ev > 0 else None
     )
     normalized_fcf_yield = (
         normalized_fcf / market_cap
         if normalized_fcf is not None and market_cap and market_cap > 0 else None
     )
 
-    valuation_available = market_cap is not None and market_cap > 0
+    valuation_available = (
+        market_cap is not None and market_cap > 0
+        and ev is not None and ev > 0
+    )
     if valuation_available:
         current_valuation = (
             _score_linear(current_nopat_yield, 0.005, 0.09, 8)
@@ -1914,6 +1939,7 @@ def _compute_lfs(series, tax_rate, price=None, shares=None, current=None, indust
             "net_cash_to_assets": net_cash_assets,
             "equity_to_assets": equity_assets,
             "market_cap_approx": market_cap,
+            "enterprise_value_approx": ev,
             "current_nopat_yield": current_nopat_yield,
             "current_fcf_yield": current_fcf_yield,
             "normalized_nopat_yield": normalized_nopat_yield,
@@ -1931,10 +1957,10 @@ def _compute_lfs(series, tax_rate, price=None, shares=None, current=None, indust
         "history": clean,
         "current_data": current_row,
         "methodology": {
-            "version": "pilot-0.3.6",
+            "version": "pilot-0.4.0",
             "main_score": "40% current + 60% normalized; quality-only rescaled when valuation data is unavailable",
-            "industry_percentile_method": "sector-adjusted parametric benchmark; not yet a live peer cross-section",
-            "note": "TTM이 가능하면 현재점수는 TTM을 사용하고, 정상화점수는 최근 연간 분포의 중앙값/지속성을 사용합니다. 업종 percentile은 무료 즉시조회 버전의 섹터 benchmark CDF입니다.",
+            "industry_percentile_method": "actual Yahoo recommended-peer sample when available; sector benchmark fallback otherwise",
+            "note": "최근점수는 최신 12개월 실적을 사용하고 장기 대표점수는 최근 연간 분포의 중앙값/지속성을 사용합니다. 영업이익 기반 수익률은 기업가치(EV), 잉여현금흐름 수익률은 전체 지분가치를 기준으로 계산합니다. 유사기업 상대점수는 실제 Yahoo 추천 유사기업 표본을 우선 사용합니다.",
         },
     }
 
