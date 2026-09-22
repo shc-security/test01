@@ -1,0 +1,60 @@
+name: Refresh SEC ticker cache
+
+on:
+  push:
+    branches: [master]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download SEC ticker master
+        run: |
+          mkdir -p data
+          curl --fail --retry 3 --retry-delay 2 \
+            -A "lattice-stock-analyzer/0.3.5 contact:https://github.com/shc-security/test01" \
+            "https://www.sec.gov/files/company_tickers.json" \
+            -o /tmp/company_tickers.json
+
+      - name: Convert to compact ticker map
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          src = json.loads(Path("/tmp/company_tickers.json").read_text())
+          out = {}
+          for item in src.values():
+              ticker = str(item.get("ticker", "")).strip().upper()
+              cik = item.get("cik_str")
+              title = item.get("title") or ticker
+              if ticker and cik is not None:
+                  out[ticker] = {"cik": int(cik), "title": title}
+
+          Path("data/sec_tickers.json").write_text(
+              json.dumps(out, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(f"cached {len(out)} SEC tickers")
+          PY
+
+      - name: Commit refreshed cache
+        run: |
+          if git diff --quiet -- data/sec_tickers.json; then
+            echo "No ticker changes"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/sec_tickers.json
+          git commit -m "Refresh SEC ticker cache"
+          git push
