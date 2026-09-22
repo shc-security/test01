@@ -29,7 +29,7 @@ def test_no_lookahead_guard():
 
 
 def test_simple_return():
-    assert simple_return(100, 120) == 0.2
+    assert abs(simple_return(100, 120) - 0.2) < 1e-12
 
 
 def test_summary_has_rank_and_horizon_outputs():
