@@ -218,7 +218,7 @@ document.getElementById("go").onclick = async function() {
     tbody.appendChild(trv);
 
     result.classList.remove("hidden");
-    status.textContent = "완료 · 최근 연간 공시 기준";
+    status.textContent = "완료 · 최신 가용 TTM/연간 공시 기준";
   } catch (e) {
     err.textContent = e.name === "AbortError"
       ? "분석 시간이 45초를 초과했습니다. 잠시 후 다시 시도해 주세요."
