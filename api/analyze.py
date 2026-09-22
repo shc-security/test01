@@ -19,6 +19,7 @@ SEC_TICKERS = "https://www.sec.gov/files/company_tickers.json"
 SEC_TICKERS_LOCAL = Path(__file__).resolve().parent.parent / "data" / "sec_tickers.json"
 YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{}"
 DART_CORP_CACHE_URL = "https://raw.githubusercontent.com/jinhoo-choi/risk-news-crolling/main/dart_corp_codes.json"
+SEC_TICKERS_MIRROR = "https://raw.githubusercontent.com/lwowlwowl/company_name_to_ticker/main/company_tickers.json"
 
 _DART_CORPS = None
 _SEC_TICKER_MAP = None
@@ -920,27 +921,28 @@ def _load_sec_tickers():
     except Exception:
         pass
 
-    # Runtime fallback: official SEC file. Some cloud IPs may receive 403.
-    try:
-        data = _http_get(
-            SEC_TICKERS,
-            headers=_sec_headers(),
-            timeout=(3, 8),
-        ).json()
-        mp = {}
-        for _, item in data.items():
-            ticker = str(item.get("ticker", "")).upper()
-            if ticker:
-                mp[ticker] = {
-                    "cik": int(item["cik_str"]),
-                    "title": item.get("title", ticker),
-                    "ticker": ticker,
-                }
-        if mp:
-            _SEC_TICKER_MAP = mp
-            return mp
-    except Exception:
-        pass
+    # Runtime fallback: public GitHub mirror of SEC's ticker file. This avoids
+    # SEC 403s from cloud/serverless IPs while keeping ticker->CIK coverage broad.
+    for url, headers in (
+        (SEC_TICKERS_MIRROR, {"User-Agent": "Mozilla/5.0 lattice-stock-analyzer"}),
+        (SEC_TICKERS, _sec_headers()),
+    ):
+        try:
+            data = _http_get(url, headers=headers, timeout=(3, 8)).json()
+            mp = {}
+            for _, item in data.items():
+                ticker = str(item.get("ticker", "")).upper()
+                if ticker:
+                    mp[ticker] = {
+                        "cik": int(item["cik_str"]),
+                        "title": item.get("title", ticker),
+                        "ticker": ticker,
+                    }
+            if mp:
+                _SEC_TICKER_MAP = mp
+                return mp
+        except Exception:
+            continue
 
     # Minimal emergency fallback for common mega-cap symbols. The scheduled
     # GitHub cache refresh normally makes this path unnecessary.
