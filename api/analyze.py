@@ -172,35 +172,29 @@ def _dart_json(endpoint, params):
 
 
 def _dart_statement_rows(corp_code, year, reprt_code):
-    def fetch_one(fs_div):
-        try:
-            data = _dart_json(
-                "fnlttSinglAcntAll.json",
-                {
-                    "corp_code": corp_code,
-                    "bsns_year": str(year),
-                    "reprt_code": reprt_code,
-                    "fs_div": fs_div,
-                },
-            )
-            if data and data.get("list"):
-                return fs_div, data["list"]
-        except Exception:
-            pass
-        return fs_div, None
+    params_base = {
+        "crtfc_key": _dart_key(),
+        "corp_code": corp_code,
+        "bsns_year": str(year),
+        "reprt_code": reprt_code,
+    }
 
-    results = {}
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        jobs = [ex.submit(fetch_one, "CFS"), ex.submit(fetch_one, "OFS")]
-        for future in as_completed(jobs):
-            fs_div, rows = future.result()
-            if rows:
-                results[fs_div] = rows
-
-    if results.get("CFS"):
-        return results["CFS"], "CFS"
-    if results.get("OFS"):
-        return results["OFS"], "OFS"
+    # Most listed companies publish consolidated statements. Try CFS first,
+    # with retries, then fall back to OFS only if CFS is truly unavailable.
+    for fs_div in ("CFS", "OFS"):
+        for timeout in ((2, 7), (3, 12)):
+            try:
+                data = _http_get(
+                    f"{DART_BASE}/fnlttSinglAcntAll.json",
+                    params={**params_base, "fs_div": fs_div},
+                    timeout=timeout,
+                ).json()
+                if data.get("status") in (None, "000") and data.get("list"):
+                    return data["list"], fs_div
+                if data.get("status") == "013":
+                    break
+            except Exception:
+                continue
     return None, None
 
 
@@ -223,6 +217,87 @@ def _dart_company_info(corp_code):
             continue
     return {}
 
+
+
+def _dart_major_rows(corp_code, year, reprt_code):
+    params = {
+        "crtfc_key": _dart_key(),
+        "corp_code": corp_code,
+        "bsns_year": str(year),
+        "reprt_code": reprt_code,
+    }
+    for timeout in ((2, 6), (3, 10)):
+        try:
+            data = _http_get(
+                f"{DART_BASE}/fnlttSinglAcnt.json",
+                params=params,
+                timeout=timeout,
+            ).json()
+            if data.get("status") in (None, "000") and data.get("list"):
+                rows = data["list"]
+                cfs = [r for r in rows if r.get("fs_div") == "CFS"]
+                ofs = [r for r in rows if r.get("fs_div") == "OFS"]
+                if cfs:
+                    return cfs, "CFS"
+                if ofs:
+                    return ofs, "OFS"
+                return rows, None
+            if data.get("status") == "013":
+                break
+        except Exception:
+            continue
+    return None, None
+
+
+def _major_value(rows, labels, amount_key):
+    if not rows:
+        return None
+    labels_n = {str(x).replace(" ", "").lower() for x in labels}
+    exact = []
+    fuzzy = []
+    for r in rows:
+        nm = str(r.get("account_nm") or "").replace(" ", "").lower()
+        v = _jnum(r.get(amount_key))
+        if v is None:
+            continue
+        if nm in labels_n:
+            exact.append(v)
+        elif any(label in nm for label in labels_n):
+            fuzzy.append(v)
+    vals = exact or fuzzy
+    if not vals:
+        return None
+    return max(vals, key=lambda x: abs(x))
+
+
+def _major_metrics_from_rows(rows, amount_key):
+    return {
+        "revenue": _major_value(
+            rows,
+            ("매출액", "수익(매출액)", "영업수익", "매출"),
+            amount_key,
+        ),
+        "operating_income": _major_value(
+            rows,
+            ("영업이익", "영업이익(손실)", "영업손익"),
+            amount_key,
+        ),
+        "net_income": _major_value(
+            rows,
+            ("당기순이익", "당기순이익(손실)", "연결당기순이익", "반기순이익", "분기순이익"),
+            amount_key,
+        ),
+        "assets": _major_value(rows, ("자산총계",), amount_key),
+        "equity": _major_value(rows, ("자본총계",), amount_key),
+    }
+
+
+def _merge_metrics(base, override):
+    out = dict(base or {})
+    for k, v in (override or {}).items():
+        if v is not None:
+            out[k] = v
+    return out
 
 def _sj_match(value, sj):
     if not sj:
@@ -382,59 +457,75 @@ def _dart_metrics_from_rows(
     }
 
 
-def _dart_interim_ttm(annual_latest, rows, year, reprt_code, fs_div):
-    if not rows or not annual_latest:
+def _dart_interim_ttm(
+    annual_latest,
+    rows,
+    year,
+    reprt_code,
+    fs_div,
+    major_rows=None,
+):
+    if not annual_latest or annual_latest.get("year") != year - 1:
+        return None
+    if not rows and not major_rows:
         return None
 
     if reprt_code in ("11012", "11014"):
-        current_income_key = _first_existing_amount_key(
-            rows, ("thstrm_add_amount", "thstrm_amount")
-        )
-        prior_income_key = _first_existing_amount_key(
-            rows, ("frmtrm_add_amount", "frmtrm_amount")
-        )
+        current_income_key = "thstrm_add_amount"
+        prior_income_key = "frmtrm_add_amount"
     else:
         current_income_key = "thstrm_amount"
         prior_income_key = "frmtrm_amount"
 
-    # Cash-flow statements in DART are cumulative YTD already.
-    current_cash_key = "thstrm_amount"
-    prior_cash_key = "frmtrm_add_amount"
-
-    current_ytd = _dart_metrics_from_rows(
-        rows,
-        income_key=current_income_key,
-        cash_key=current_cash_key,
-        balance_key="thstrm_amount",
+    current_ytd = (
+        _dart_metrics_from_rows(
+            rows,
+            income_key=current_income_key,
+            cash_key="thstrm_amount",
+            balance_key="thstrm_amount",
+        )
+        if rows else {}
     )
-    prior_ytd = _dart_metrics_from_rows(
-        rows,
-        income_key=prior_income_key,
-        cash_key=prior_cash_key,
-        balance_key="frmtrm_amount",
+    prior_ytd = (
+        _dart_metrics_from_rows(
+            rows,
+            income_key=prior_income_key,
+            cash_key="frmtrm_amount",
+            balance_key="frmtrm_amount",
+        )
+        if rows else {}
     )
 
-    flow_fields = ("revenue", "operating_income", "net_income", "cfo", "capex")
-    if (
-        current_ytd.get("revenue") is None
-        or prior_ytd.get("revenue") is None
-        or current_ytd.get("operating_income") is None
-        or prior_ytd.get("operating_income") is None
-    ):
+    # The compact major-account endpoint is much less ambiguous for
+    # revenue / operating profit / net income.
+    if major_rows:
+        current_major = _major_metrics_from_rows(major_rows, current_income_key)
+        prior_major = _major_metrics_from_rows(major_rows, prior_income_key)
+        current_ytd = _merge_metrics(current_ytd, current_major)
+        prior_ytd = _merge_metrics(prior_ytd, prior_major)
+
+    required = ("revenue", "operating_income", "net_income")
+    if any(current_ytd.get(k) is None or prior_ytd.get(k) is None for k in required):
         return None
 
+    flow_fields = ("revenue", "operating_income", "net_income", "cfo", "capex")
     out = {"year": year, "is_ttm": True, "fs_div": fs_div}
+
     for k in flow_fields:
         annual = annual_latest.get(k)
         cy = current_ytd.get(k)
         py = prior_ytd.get(k)
-        out[k] = (annual + cy - py) if annual is not None and cy is not None and py is not None else annual
+        out[k] = (
+            annual + cy - py
+            if annual is not None and cy is not None and py is not None
+            else None
+        )
 
     for k in ("assets", "equity", "cash", "debt"):
         out[k] = current_ytd.get(k) if current_ytd.get(k) is not None else annual_latest.get(k)
 
     label = {"11013": "Q1", "11012": "H1", "11014": "Q3"}.get(reprt_code, reprt_code)
-    out["basis"] = f"TTM {year} {label}"
+    out["basis"] = f"TTM {year} {label} · FY{annual_latest['year']} bridge"
     out["report_code"] = reprt_code
     out["ttm_bridge"] = {
         "annual_year": annual_latest.get("year"),
@@ -453,7 +544,7 @@ def _dart_share_count(corp_code, year, reprt_code="11011"):
         "reprt_code": reprt_code,
     }
     data = None
-    for timeout in ((1.5, 4.5), (2, 7)):
+    for timeout in ((2, 6), (3, 10)):
         try:
             candidate = _http_get(
                 f"{DART_BASE}/stockTotqySttus.json",
@@ -470,37 +561,39 @@ def _dart_share_count(corp_code, year, reprt_code="11011"):
 
     rows = data.get("list") or []
 
-    # Prefer the explicit total row when available.
-    total_markers = ("합계", "계", "total")
+    # For the ordinary/common ticker, prefer the common issued-share row.
     for r in rows:
         se = str(r.get("se") or "").strip().lower()
-        if any(m in se for m in total_markers):
-            for key in ("distb_stock_co", "istc_totqy"):
-                v = _jnum(r.get(key))
-                if v is not None and v > 0:
-                    return v
-
-    # Otherwise sum individual share classes, excluding notes/total-like rows.
-    class_vals = []
-    for r in rows:
-        se = str(r.get("se") or "").strip().lower()
-        if any(m in se for m in ("합계", "total", "비고", "note")):
-            continue
-        v = _jnum(r.get("distb_stock_co"))
-        if v is None or v <= 0:
+        if "보통주" in se or "common" in se:
             v = _jnum(r.get("istc_totqy"))
-        if v is not None and v > 0:
-            class_vals.append(v)
-    if class_vals:
-        return sum(class_vals)
-
-    # Last resort: maximum disclosed positive issued/distributed count.
-    vals = []
-    for r in rows:
-        for key in ("distb_stock_co", "istc_totqy"):
-            v = _jnum(r.get(key))
             if v is not None and v > 0:
-                vals.append(v)
+                return v
+            v = _jnum(r.get("distb_stock_co"))
+            if v is not None and v > 0:
+                return v
+
+    # If there is only one real security class, use its issued shares.
+    class_rows = []
+    for r in rows:
+        se = str(r.get("se") or "").strip().lower()
+        if any(x in se for x in ("합계", "total", "비고", "note")):
+            continue
+        v = _jnum(r.get("istc_totqy"))
+        if v is not None and v > 0:
+            class_rows.append(v)
+    if len(class_rows) == 1:
+        return class_rows[0]
+
+    # Fallback to explicit total issued shares.
+    for r in rows:
+        se = str(r.get("se") or "").strip().lower()
+        if "합계" in se or se == "계" or "total" in se:
+            v = _jnum(r.get("istc_totqy"))
+            if v is not None and v > 0:
+                return v
+
+    vals = [_jnum(r.get("istc_totqy")) for r in rows]
+    vals = [v for v in vals if v is not None and v > 0]
     return max(vals) if vals else None
 
 
@@ -1284,7 +1377,7 @@ def _compute_lfs(series, tax_rate, price=None, shares=None, current=None, indust
         "history": clean,
         "current_data": current_row,
         "methodology": {
-            "version": "pilot-0.3.1",
+            "version": "pilot-0.3.2",
             "main_score": "40% current + 60% normalized; quality-only rescaled when valuation data is unavailable",
             "industry_percentile_method": "sector-adjusted parametric benchmark; not yet a live peer cross-section",
             "note": "TTM이 가능하면 현재점수는 TTM을 사용하고, 정상화점수는 최근 연간 분포의 중앙값/지속성을 사용합니다. 업종 percentile은 무료 즉시조회 버전의 섹터 benchmark CDF입니다.",
@@ -1307,56 +1400,74 @@ def analyze_kr(q):
     company = _resolve_kr_company(q)
     now = datetime.utcnow()
     latest_year = now.year - 1
-    annual_years = [latest_year, latest_year - 3, latest_year - 6]
+    history_year = latest_year - 3
     interim_year, interim_code, interim_label = _kr_interim_target(now)
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        annual_jobs = {
-            ex.submit(_dart_annual_rows, company["corp_code"], y): y for y in annual_years
-        }
-        interim_job = (
+    # Two annual reports are enough: each annual response contains current,
+    # prior and two-years-prior comparative columns.
+    with ThreadPoolExecutor(max_workers=7) as ex:
+        latest_full_job = ex.submit(_dart_annual_rows, company["corp_code"], latest_year)
+        history_full_job = ex.submit(_dart_annual_rows, company["corp_code"], history_year)
+        latest_major_job = ex.submit(_dart_major_rows, company["corp_code"], latest_year, "11011")
+        history_major_job = ex.submit(_dart_major_rows, company["corp_code"], history_year, "11011")
+        interim_full_job = (
             ex.submit(_dart_statement_rows, company["corp_code"], interim_year, interim_code)
+            if interim_code else None
+        )
+        interim_major_job = (
+            ex.submit(_dart_major_rows, company["corp_code"], interim_year, interim_code)
             if interim_code else None
         )
         info_job = ex.submit(_dart_company_info, company["corp_code"])
         price_job = ex.submit(_kr_price, company["stock_code"]) if company["stock_code"] else None
-        share_job = ex.submit(
-            _dart_share_count,
-            company["corp_code"],
-            interim_year if interim_code else latest_year,
-            interim_code if interim_code else "11011",
-        )
-
-        raw_sets = {}
-        for future, y in [(f, y) for f, y in annual_jobs.items()]:
-            try:
-                raw, fs_div = future.result(timeout=8)
-            except Exception:
-                raw, fs_div = None, None
-            if raw:
-                raw_sets[y] = (raw, fs_div)
 
         try:
-            interim_rows, interim_fs = interim_job.result(timeout=8) if interim_job else (None, None)
+            latest_full, latest_fs = latest_full_job.result(timeout=18)
+        except Exception:
+            latest_full, latest_fs = None, None
+        try:
+            history_full, history_fs = history_full_job.result(timeout=18)
+        except Exception:
+            history_full, history_fs = None, None
+        try:
+            latest_major, latest_major_fs = latest_major_job.result(timeout=14)
+        except Exception:
+            latest_major, latest_major_fs = None, None
+        try:
+            history_major, history_major_fs = history_major_job.result(timeout=14)
+        except Exception:
+            history_major, history_major_fs = None, None
+        try:
+            interim_rows, interim_fs = (
+                interim_full_job.result(timeout=18) if interim_full_job else (None, None)
+            )
         except Exception:
             interim_rows, interim_fs = None, None
         try:
-            company_info = info_job.result(timeout=6) or {}
+            interim_major, interim_major_fs = (
+                interim_major_job.result(timeout=14) if interim_major_job else (None, None)
+            )
+        except Exception:
+            interim_major, interim_major_fs = None, None
+        try:
+            company_info = info_job.result(timeout=10) or {}
         except Exception:
             company_info = {}
         try:
-            p = price_job.result(timeout=7) if price_job else None
+            p = price_job.result(timeout=8) if price_job else None
         except Exception:
             p = None
-        try:
-            shares = share_job.result(timeout=7)
-        except Exception:
-            shares = None
+
+    raw_sets = {
+        latest_year: (latest_full, latest_fs, latest_major, latest_major_fs),
+        history_year: (history_full, history_fs, history_major, history_major_fs),
+    }
 
     rows_by_year = {}
     fs_used = {}
-    for report_year in sorted(raw_sets.keys(), reverse=True):
-        raw, fs_div = raw_sets[report_year]
+
+    for report_year in (latest_year, history_year):
+        full_rows, fs_div, major_rows, major_fs = raw_sets[report_year]
         for offset, amount_key in (
             (0, "thstrm_amount"),
             (1, "frmtrm_amount"),
@@ -1365,33 +1476,71 @@ def analyze_kr(q):
             y = report_year - offset
             if y in rows_by_year:
                 continue
-            m = _dart_metrics_from_rows(raw, income_key=amount_key, cash_key=amount_key, balance_key=amount_key)
+
+            base = (
+                _dart_metrics_from_rows(
+                    full_rows,
+                    income_key=amount_key,
+                    cash_key=amount_key,
+                    balance_key=amount_key,
+                )
+                if full_rows else {}
+            )
+            major = (
+                _major_metrics_from_rows(major_rows, amount_key)
+                if major_rows else {}
+            )
+            m = _merge_metrics(base, major)
+
             if m.get("revenue") is None or m.get("operating_income") is None:
                 continue
             m["year"] = y
             rows_by_year[y] = m
-            fs_used[y] = fs_div
+            fs_used[y] = major_fs or fs_div
 
-    rows = [rows_by_year[y] for y in sorted(rows_by_year)][-6:]
-    if len(rows) < 2:
+    if latest_year not in rows_by_year:
         raise RuntimeError(
-            "OpenDART 연간 재무제표를 충분히 읽지 못했습니다. 해당 기업의 계정 구조가 표준형과 다를 수 있습니다."
+            f"FY{latest_year} 사업보고서 핵심 재무값을 확인하지 못했습니다. "
+            "오래된 연도로 TTM을 대체하지 않고 분석을 중단했습니다. 잠시 후 다시 시도해 주세요."
         )
 
-    annual_latest = rows[-1]
+    rows = [rows_by_year[y] for y in sorted(rows_by_year)][-6:]
+    if len(rows) < 4:
+        raise RuntimeError(
+            "최근 장기 재무이력이 충분하지 않아 LFS를 안정적으로 계산할 수 없습니다."
+        )
+
+    annual_latest = rows_by_year[latest_year]
     current = None
-    if interim_rows and interim_code:
+    if interim_code and (interim_rows or interim_major):
         current = _dart_interim_ttm(
             annual_latest,
             interim_rows,
             interim_year,
             interim_code,
-            interim_fs,
+            interim_fs or interim_major_fs,
+            major_rows=interim_major,
         )
 
-    if shares is None:
+    # Never label an old-FY bridge as current TTM.
+    if interim_code and current is None:
+        raise RuntimeError(
+            f"{interim_year} {interim_label} 누적값으로 TTM을 검증하지 못했습니다. "
+            "잘못된 TTM 점수 대신 분석을 중단했습니다."
+        )
+
+    # Share count is fetched after the financial bridge succeeds; a failed
+    # valuation fetch must not corrupt quality calculations.
+    shares = None
+    share_year = interim_year if interim_code else latest_year
+    share_code = interim_code if interim_code else "11011"
+    try:
+        shares = _dart_share_count(company["corp_code"], share_year, share_code)
+    except Exception:
+        shares = None
+    if shares is None and share_year != latest_year:
         try:
-            shares = _dart_share_count(company["corp_code"], annual_latest["year"], "11011")
+            shares = _dart_share_count(company["corp_code"], latest_year, "11011")
         except Exception:
             shares = None
 
@@ -1421,6 +1570,7 @@ def analyze_kr(q):
             "corp_code": company["corp_code"],
             "price": p,
             "shares_approx": shares,
+            "annual_base_year": latest_year,
             "fs_div_by_year": fs_used,
             "interim_report": {
                 "year": interim_year,
@@ -1428,7 +1578,11 @@ def analyze_kr(q):
                 "label": interim_label,
                 "used_for_ttm": bool(current),
             },
-            "sources": ["OpenDART", "SEC-style sector benchmark logic", "Yahoo Finance chart endpoint (price fallback)"],
+            "sources": [
+                "OpenDART full financial statements",
+                "OpenDART major accounts",
+                "Yahoo Finance chart endpoint (price fallback)",
+            ],
         }
     )
     return result
