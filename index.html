@@ -104,9 +104,22 @@ document.getElementById("go").onclick = async function() {
   btn.disabled = true;
   status.textContent = "공시 데이터를 불러와 계산 중...";
   try {
-    var res = await fetch("/api/analyze?market=" + encodeURIComponent(market) + "&q=" + encodeURIComponent(q));
-    var body = await res.json();
-    if (!body.ok) throw new Error(body.error || "분석 실패");
+    var controller = new AbortController();
+    var timer = setTimeout(function(){ controller.abort(); }, 45000);
+    var res;
+    var body;
+    try {
+      res = await fetch("/api/analyze?market=" + encodeURIComponent(market) + "&q=" + encodeURIComponent(q), {signal: controller.signal});
+      var text = await res.text();
+      try {
+        body = JSON.parse(text);
+      } catch (_) {
+        throw new Error("서버가 JSON이 아닌 응답을 반환했습니다. HTTP " + res.status);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok || !body.ok) throw new Error((body && body.error) || ("분석 실패 · HTTP " + res.status));
     var d = body.data;
 
     document.getElementById("name").textContent = d.company + " (" + d.ticker + ")";
@@ -154,7 +167,9 @@ document.getElementById("go").onclick = async function() {
     result.classList.remove("hidden");
     status.textContent = "완료 · 최근 연간 공시 기준";
   } catch (e) {
-    err.textContent = e.message;
+    err.textContent = e.name === "AbortError"
+      ? "분석 시간이 45초를 초과했습니다. 잠시 후 다시 시도해 주세요."
+      : e.message;
     err.classList.remove("hidden");
     status.textContent = "";
   } finally {
