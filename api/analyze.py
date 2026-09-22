@@ -587,7 +587,7 @@ def _dart_interim_ttm(
     return out
 
 
-def _dart_share_count(corp_code, year, reprt_code="11011"):
+def _dart_share_structure(corp_code, year, reprt_code="11011"):
     params = {
         "crtfc_key": _dart_key(),
         "corp_code": corp_code,
@@ -611,41 +611,86 @@ def _dart_share_count(corp_code, year, reprt_code="11011"):
         return None
 
     rows = data.get("list") or []
+    common_shares = None
+    preferred = []
+    total_issued = None
 
-    # For the ordinary/common ticker, prefer the common issued-share row.
     for r in rows:
-        se = str(r.get("se") or "").strip().lower()
-        if "보통주" in se or "common" in se:
-            v = _jnum(r.get("istc_totqy"))
-            if v is not None and v > 0:
-                return v
-            v = _jnum(r.get("distb_stock_co"))
-            if v is not None and v > 0:
-                return v
-
-    # If there is only one real security class, use its issued shares.
-    class_rows = []
-    for r in rows:
-        se = str(r.get("se") or "").strip().lower()
-        if any(x in se for x in ("합계", "total", "비고", "note")):
+        label = str(r.get("se") or "").strip()
+        label_l = label.lower()
+        issued = _jnum(r.get("istc_totqy"))
+        if issued is None or issued <= 0:
             continue
-        v = _jnum(r.get("istc_totqy"))
-        if v is not None and v > 0:
-            class_rows.append(v)
-    if len(class_rows) == 1:
-        return class_rows[0]
 
-    # Fallback to explicit total issued shares.
-    for r in rows:
-        se = str(r.get("se") or "").strip().lower()
-        if "합계" in se or se == "계" or "total" in se:
-            v = _jnum(r.get("istc_totqy"))
-            if v is not None and v > 0:
-                return v
+        if "보통주" in label_l or "common" in label_l:
+            common_shares = issued
+        elif "우선" in label_l or "preferred" in label_l:
+            preferred.append({"label": label, "shares": issued})
+        elif "합계" in label_l or label_l == "계" or "total" in label_l:
+            total_issued = issued
 
-    vals = [_jnum(r.get("istc_totqy")) for r in rows]
-    vals = [v for v in vals if v is not None and v > 0]
-    return max(vals) if vals else None
+    if common_shares is None:
+        real_classes = []
+        for r in rows:
+            label_l = str(r.get("se") or "").strip().lower()
+            if any(x in label_l for x in ("합계", "total", "비고", "note")):
+                continue
+            issued = _jnum(r.get("istc_totqy"))
+            if issued is not None and issued > 0:
+                real_classes.append(issued)
+        if len(real_classes) == 1:
+            common_shares = real_classes[0]
+
+    return {
+        "common_shares": common_shares,
+        "preferred_classes": preferred,
+        "total_issued_shares": total_issued,
+    }
+
+
+def _dart_share_count(corp_code, year, reprt_code="11011"):
+    s = _dart_share_structure(corp_code, year, reprt_code)
+    if not s:
+        return None
+    return s.get("common_shares") or s.get("total_issued_shares")
+
+
+def _kr_preferred_market_cap(stock_code, preferred_classes):
+    if not preferred_classes:
+        return 0.0, [], True
+    if not stock_code or len(stock_code) != 6 or not stock_code[-1].isdigit():
+        return None, [], False
+
+    base = stock_code[:-1]
+    candidates = [base + x for x in ("5", "7", "9", "1")]
+    prices = {}
+
+    with ThreadPoolExecutor(max_workers=len(candidates)) as ex:
+        jobs = {ex.submit(_kr_price, code): code for code in candidates}
+        for future in as_completed(jobs):
+            code = jobs[future]
+            try:
+                p = future.result()
+            except Exception:
+                p = None
+            if p and p.get("price"):
+                prices[code] = p
+
+    found = [(code, prices[code]) for code in candidates if code in prices]
+    if len(found) < len(preferred_classes):
+        return None, found, False
+
+    preferred_value = 0.0
+    used = []
+    for cls, (code, p) in zip(preferred_classes, found):
+        preferred_value += cls["shares"] * p["price"]
+        used.append({
+            "label": cls["label"],
+            "shares": cls["shares"],
+            "symbol": p.get("symbol"),
+            "price": p.get("price"),
+        })
+    return preferred_value, used, True
 
 
 def _yahoo_price(symbol):
