@@ -1224,17 +1224,26 @@ def _compute_lfs(series, tax_rate, price=None, shares=None, current=None, indust
         + _score_linear(normalized_fcf_margin, -0.05, 0.20, 5)
         + (positive_fcf_years / max(1, len(clean))) * 4
     )
+
+    # Do not manufacture a "neutral" current cash-flow score when the
+    # latest-12-month CFO/FCF bridge is unavailable. Mark it missing and
+    # reweight the remaining current-quality components instead.
+    current_cash_data_available = (
+        current_cash_conversion is not None and current_fcf_margin is not None
+    )
     current_cash_quality = (
         _score_linear(current_cash_conversion, 0.50, 1.50, 6)
         + _score_linear(current_fcf_margin, -0.05, 0.25, 5)
         + (positive_fcf_years / max(1, len(clean))) * 4
+        if current_cash_data_available
+        else None
     )
 
     current_components = {
         "economic_quality_proxy": round(current_quality, 2),
         "capital_efficiency": round(current_capital, 2),
         "growth_reinvestment_proxy": round(growth_score, 2),
-        "cash_quality": round(current_cash_quality, 2),
+        "cash_quality": round(current_cash_quality, 2) if current_cash_quality is not None else None,
         "financial_strength": round(financial, 2),
         "persistence_normalization": round(persistence_score, 2),
     }
@@ -1289,8 +1298,29 @@ def _compute_lfs(series, tax_rate, price=None, shares=None, current=None, indust
         current_valuation = None
         normalized_valuation = None
 
-    current_quality_score = round(sum(current_components.values()), 1)
-    normalized_quality_score = round(sum(normalized_components.values()), 1)
+    component_max = {
+        "economic_quality_proxy": 15.0,
+        "capital_efficiency": 20.0,
+        "growth_reinvestment_proxy": 15.0,
+        "cash_quality": 15.0,
+        "financial_strength": 10.0,
+        "persistence_normalization": 10.0,
+    }
+
+    def _reweighted_quality(component_values):
+        available_keys = [k for k, v in component_values.items() if v is not None]
+        available_max = sum(component_max[k] for k in available_keys)
+        available_score = sum(component_values[k] for k in available_keys)
+        if available_max <= 0:
+            return None, 0.0
+        # Rescale the available quality evidence back to the 85-point quality scale.
+        return round(available_score / available_max * 85.0, 1), available_max
+
+    current_quality_score, current_quality_available_max = _reweighted_quality(current_components)
+    normalized_quality_score, normalized_quality_available_max = _reweighted_quality(normalized_components)
+
+    if current_quality_score is None or normalized_quality_score is None:
+        raise RuntimeError("품질 점수 계산에 필요한 재무 데이터가 부족합니다.")
 
     if valuation_available:
         current_score = round(current_quality_score + current_valuation, 1)
@@ -1333,6 +1363,16 @@ def _compute_lfs(series, tax_rate, price=None, shares=None, current=None, indust
         "current_quality_score": current_quality_score,
         "normalized_quality_score": normalized_quality_score,
         "valuation_available": valuation_available,
+        "data_quality": {
+            "current_cash_flow_available": current_cash_data_available,
+            "current_quality_available_points": current_quality_available_max,
+            "normalized_quality_available_points": normalized_quality_available_max,
+            "warnings": (
+                []
+                if current_cash_data_available
+                else ["최근 12개월 현금흐름 데이터가 없어 해당 항목을 제외하고 나머지 항목 비중을 재조정했습니다."]
+            ),
+        },
         "current_valuation_score": round(current_valuation, 1) if current_valuation is not None else None,
         "normalized_valuation_score": round(normalized_valuation, 1) if normalized_valuation is not None else None,
         "current_components": current_components,
@@ -1377,7 +1417,7 @@ def _compute_lfs(series, tax_rate, price=None, shares=None, current=None, indust
         "history": clean,
         "current_data": current_row,
         "methodology": {
-            "version": "pilot-0.3.2",
+            "version": "pilot-0.3.3",
             "main_score": "40% current + 60% normalized; quality-only rescaled when valuation data is unavailable",
             "industry_percentile_method": "sector-adjusted parametric benchmark; not yet a live peer cross-section",
             "note": "TTM이 가능하면 현재점수는 TTM을 사용하고, 정상화점수는 최근 연간 분포의 중앙값/지속성을 사용합니다. 업종 percentile은 무료 즉시조회 버전의 섹터 benchmark CDF입니다.",
