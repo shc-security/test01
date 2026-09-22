@@ -16,6 +16,7 @@ import requests
 DART_BASE = "https://opendart.fss.or.kr/api"
 SEC_BASE = "https://data.sec.gov"
 SEC_TICKERS = "https://www.sec.gov/files/company_tickers.json"
+SEC_TICKERS_LOCAL = Path(__file__).resolve().parent.parent / "data" / "sec_tickers.json"
 YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{}"
 DART_CORP_CACHE_URL = "https://raw.githubusercontent.com/jinhoo-choi/risk-news-crolling/main/dart_corp_codes.json"
 
@@ -673,18 +674,79 @@ def _load_sec_tickers():
     global _SEC_TICKER_MAP
     if _SEC_TICKER_MAP is not None:
         return _SEC_TICKER_MAP
-    data = _http_get(SEC_TICKERS, headers=_sec_headers()).json()
-    mp = {}
-    for _, item in data.items():
-        ticker = str(item.get("ticker", "")).upper()
-        if ticker:
-            mp[ticker] = {
-                "cik": int(item["cik_str"]),
-                "title": item.get("title", ticker),
-                "ticker": ticker,
-            }
-    _SEC_TICKER_MAP = mp
-    return mp
+
+    # Primary path: repository-cached SEC ticker/CIK mapping.
+    # This avoids SEC www-host 403s from serverless/Vercel IP ranges.
+    try:
+        if SEC_TICKERS_LOCAL.exists():
+            data = json.loads(SEC_TICKERS_LOCAL.read_text(encoding="utf-8"))
+            mp = {}
+            if isinstance(data, dict):
+                for ticker, item in data.items():
+                    ticker_u = str(ticker).upper().strip()
+                    if not ticker_u:
+                        continue
+                    if isinstance(item, dict):
+                        cik = item.get("cik") or item.get("cik_str")
+                        title = item.get("title") or item.get("name") or ticker_u
+                    else:
+                        cik = item
+                        title = ticker_u
+                    try:
+                        cik_i = int(cik)
+                    except Exception:
+                        continue
+                    mp[ticker_u] = {
+                        "cik": cik_i,
+                        "title": str(title),
+                        "ticker": ticker_u,
+                    }
+            if mp:
+                _SEC_TICKER_MAP = mp
+                return mp
+    except Exception:
+        pass
+
+    # Runtime fallback: official SEC file. Some cloud IPs may receive 403.
+    try:
+        data = _http_get(
+            SEC_TICKERS,
+            headers=_sec_headers(),
+            timeout=(3, 8),
+        ).json()
+        mp = {}
+        for _, item in data.items():
+            ticker = str(item.get("ticker", "")).upper()
+            if ticker:
+                mp[ticker] = {
+                    "cik": int(item["cik_str"]),
+                    "title": item.get("title", ticker),
+                    "ticker": ticker,
+                }
+        if mp:
+            _SEC_TICKER_MAP = mp
+            return mp
+    except Exception:
+        pass
+
+    # Minimal emergency fallback for common mega-cap symbols. The scheduled
+    # GitHub cache refresh normally makes this path unnecessary.
+    emergency = {
+        "AAPL": {"cik": 320193, "title": "Apple Inc.", "ticker": "AAPL"},
+        "MSFT": {"cik": 789019, "title": "Microsoft Corp.", "ticker": "MSFT"},
+        "NVDA": {"cik": 1045810, "title": "NVIDIA Corp.", "ticker": "NVDA"},
+        "AMZN": {"cik": 1018724, "title": "Amazon.com Inc.", "ticker": "AMZN"},
+        "GOOGL": {"cik": 1652044, "title": "Alphabet Inc.", "ticker": "GOOGL"},
+        "GOOG": {"cik": 1652044, "title": "Alphabet Inc.", "ticker": "GOOG"},
+        "META": {"cik": 1326801, "title": "Meta Platforms Inc.", "ticker": "META"},
+        "TSLA": {"cik": 1318605, "title": "Tesla Inc.", "ticker": "TSLA"},
+        "AMD": {"cik": 2488, "title": "Advanced Micro Devices Inc.", "ticker": "AMD"},
+        "AVGO": {"cik": 1730168, "title": "Broadcom Inc.", "ticker": "AVGO"},
+        "NFLX": {"cik": 1065280, "title": "Netflix Inc.", "ticker": "NFLX"},
+        "PLTR": {"cik": 1321655, "title": "Palantir Technologies Inc.", "ticker": "PLTR"},
+    }
+    _SEC_TICKER_MAP = emergency
+    return emergency
 
 
 def _sec_company(q):
@@ -1447,7 +1509,7 @@ def _compute_lfs(series, tax_rate, price=None, shares=None, current=None, indust
         "history": clean,
         "current_data": current_row,
         "methodology": {
-            "version": "pilot-0.3.4",
+            "version": "pilot-0.3.5",
             "main_score": "40% current + 60% normalized; quality-only rescaled when valuation data is unavailable",
             "industry_percentile_method": "sector-adjusted parametric benchmark; not yet a live peer cross-section",
             "note": "TTM이 가능하면 현재점수는 TTM을 사용하고, 정상화점수는 최근 연간 분포의 중앙값/지속성을 사용합니다. 업종 percentile은 무료 즉시조회 버전의 섹터 benchmark CDF입니다.",
