@@ -34,3 +34,7 @@ The UI remains disabled until the validation gates pass on the full run. This is
 ## Secret setup verification
 
 The push-triggered smoke test checks whether the repository `DART_API_KEY` Actions secret is available before running the point-in-time data smoke test.
+
+## Full validation trigger
+
+This marker is used only to launch the validated full point-in-time backtest workflow.
