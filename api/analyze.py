@@ -6,6 +6,7 @@ import zipfile
 from datetime import datetime
 from io import BytesIO
 from http.server import BaseHTTPRequestHandler
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 import xml.etree.ElementTree as ET
 
@@ -679,8 +680,16 @@ def analyze_us(q):
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        parsed = urlparse(self.path)
+
+        if parsed.path in ("/", "/index.html"):
+            return self._send_index()
+
+        if parsed.path != "/api/analyze":
+            return self._send(404, {"ok": False, "error": "Not found"})
+
         try:
-            qs = parse_qs(urlparse(self.path).query)
+            qs = parse_qs(parsed.query)
             market = (qs.get("market", ["KR"])[0] or "KR").upper()
             q = (qs.get("q", [""])[0] or "").strip()
             if not q:
@@ -696,6 +705,18 @@ class handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "data": result})
         except Exception as e:
             self._send(400, {"ok": False, "error": str(e)})
+
+    def _send_index(self):
+        index_path = Path(__file__).resolve().parent.parent / "index.html"
+        try:
+            body = index_path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:
+            self._send(500, {"ok": False, "error": f"index.html을 읽지 못했습니다: {e}"})
 
     def _send(self, status, payload):
         body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
