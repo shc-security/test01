@@ -1,0 +1,50 @@
+{
+  "AAPL": {
+    "cik": 320193,
+    "title": "Apple Inc."
+  },
+  "MSFT": {
+    "cik": 789019,
+    "title": "Microsoft Corp."
+  },
+  "NVDA": {
+    "cik": 1045810,
+    "title": "NVIDIA Corp."
+  },
+  "AMZN": {
+    "cik": 1018724,
+    "title": "Amazon.com Inc."
+  },
+  "GOOGL": {
+    "cik": 1652044,
+    "title": "Alphabet Inc."
+  },
+  "GOOG": {
+    "cik": 1652044,
+    "title": "Alphabet Inc."
+  },
+  "META": {
+    "cik": 1326801,
+    "title": "Meta Platforms Inc."
+  },
+  "TSLA": {
+    "cik": 1318605,
+    "title": "Tesla Inc."
+  },
+  "AMD": {
+    "cik": 2488,
+    "title": "Advanced Micro Devices Inc."
+  },
+  "AVGO": {
+    "cik": 1730168,
+    "title": "Broadcom Inc."
+  },
+  "NFLX": {
+    "cik": 1065280,
+    "title": "Netflix Inc."
+  },
+  "PLTR": {
+    "cik": 1321655,
+    "title": "Palantir Technologies Inc."
+  }
+}
