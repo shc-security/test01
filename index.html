@@ -54,6 +54,7 @@
       <div id="name" style="font-weight:700"></div>
       <div class="score"><span id="score"></span><span style="font-size:20px"> / 100</span></div>
       <div id="price" class="muted"></div>
+      <div id="basis" class="muted" style="margin-top:4px"></div>
       <div class="grid" id="metrics"></div>
     </div>
 
@@ -65,8 +66,8 @@
     <div class="card">
       <h3>주의</h3>
       <div class="muted">
-        현재 버전은 업종별 percentile 정규화 전의 파일럿입니다. 은행·보험·증권처럼 일반 제조/서비스업과 자본구조가 다른 업종에는 ROIC 해석이 적합하지 않을 수 있습니다.
-        무료 가격 데이터는 비공식 fallback이므로 지연·누락 가능성이 있습니다.
+        현재 버전은 업종별 percentile 정규화 전의 절대기준 파일럿입니다. '경제적 질 Proxy'는 해자를 확정하는 지표가 아니며, 현재 재무점수는 최신 연간 사업보고서 기준입니다.
+        은행·보험·증권처럼 일반 제조/서비스업과 자본구조가 다른 업종에는 ROIC 해석이 적합하지 않을 수 있습니다. 무료 가격 데이터는 비공식 fallback이므로 지연·누락 가능성이 있습니다.
       </div>
     </div>
   </div>
@@ -126,20 +127,26 @@ document.getElementById("go").onclick = async function() {
     document.getElementById("score").textContent = d.score.toFixed(1);
     document.getElementById("price").textContent =
       d.price && d.price.price ? "가격 참고: " + num(d.price.price) + " " + (d.price.currency || "") : "가격 데이터 없음";
+    document.getElementById("basis").textContent =
+      "재무 기준: " + d.metrics.latest_year + " 사업보고서 · LFS " + (d.methodology && d.methodology.version ? d.methodology.version : "");
 
     var metrics = document.getElementById("metrics");
     metrics.innerHTML = "";
     addMetric(metrics, "ROIC proxy", pct(d.metrics.roic_proxy));
-    addMetric(metrics, "Incremental ROIC proxy", pct(d.metrics.incremental_roic_proxy));
+    addMetric(metrics, "5Y Median ROIC proxy", pct(d.metrics.median_roic_proxy));
+    addMetric(metrics, "3Y Incremental ROIC proxy", pct(d.metrics.incremental_roic_proxy));
     addMetric(metrics, "매출 CAGR", pct(d.metrics.revenue_cagr));
     addMetric(metrics, "Cash Conversion", d.metrics.cash_conversion == null ? "-" : d.metrics.cash_conversion.toFixed(2) + "x");
     addMetric(metrics, "FCF Margin", pct(d.metrics.fcf_margin));
     addMetric(metrics, "현재 영업마진", pct(d.metrics.operating_margin));
     addMetric(metrics, "정상화 영업마진", pct(d.metrics.normalized_operating_margin));
     addMetric(metrics, "Normalized NOPAT Yield", pct(d.metrics.normalized_nopat_yield));
+    addMetric(metrics, "Current FCF Yield", pct(d.metrics.current_fcf_yield));
+    addMetric(metrics, "Quality subtotal", d.quality_score.toFixed(1) + " / 85");
+    addMetric(metrics, "Valuation subtotal", d.valuation_score.toFixed(1) + " / 15");
 
     var labels = {
-      moat_proxy:"해자 Proxy",
+      economic_quality_proxy:"경제적 질 Proxy",
       capital_efficiency:"자본효율성",
       growth_reinvestment_proxy:"성장·재투자 Proxy",
       cash_quality:"현금흐름·이익의 질",
@@ -148,7 +155,7 @@ document.getElementById("go").onclick = async function() {
       valuation:"밸류에이션"
     };
     var maxes = {
-      moat_proxy:15,
+      economic_quality_proxy:15,
       capital_efficiency:20,
       growth_reinvestment_proxy:15,
       cash_quality:15,
