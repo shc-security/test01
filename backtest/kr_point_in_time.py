@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from pykrx import stock
+import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -28,6 +28,8 @@ from backtest.core import HORIZONS, Observation, assert_point_in_time, rank_scor
 DART_BASE = "https://opendart.fss.or.kr/api"
 CACHE_DIR = ROOT / "backtest" / ".cache"
 OUT_DIR = ROOT / "backtest" / "out"
+MARCAP_URL = "https://raw.githubusercontent.com/FinanceData/marcap/master/data/marcap-{year}.parquet"
+YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
 
 def _json_dump(path: Path, value: Any) -> None:
@@ -210,6 +212,94 @@ class DartCache:
         return {"common_shares": common, "preferred_classes": preferred, "total_issued_shares": total}
 
 
+
+class MarcapStore:
+    """Point-in-time KRX universe and price source using FinanceData/marcap."""
+
+    def __init__(self):
+        self.root = CACHE_DIR / "marcap"
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._frames: dict[int, pd.DataFrame] = {}
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "lattice-stock-analyzer-backtest/0.1"})
+
+    def year(self, year: int) -> pd.DataFrame:
+        if year in self._frames:
+            return self._frames[year]
+
+        path = self.root / f"marcap-{year}.parquet"
+        if not path.exists():
+            url = MARCAP_URL.format(year=year)
+
+            def call():
+                r = self.session.get(url, timeout=(5, 90))
+                r.raise_for_status()
+                return r.content
+
+            raw = _retry(call, attempts=4, base_sleep=2.0)
+            path.write_bytes(raw)
+
+        df = pd.read_parquet(path)
+        if "Date" not in df.columns:
+            if getattr(df.index, "name", None) == "Date":
+                df = df.reset_index()
+            else:
+                df = df.reset_index()
+                if "Date" not in df.columns and "index" in df.columns:
+                    df = df.rename(columns={"index": "Date"})
+        df["Date"] = pd.to_datetime(df["Date"]).dt.date
+        df["Code"] = df["Code"].astype(str).str.zfill(6)
+        self._frames[year] = df
+        return df
+
+    def snapshot_on_or_after(self, target: date) -> tuple[date, pd.DataFrame]:
+        for year in (target.year, target.year + 1):
+            df = self.year(year)
+            part = df[df["Date"] >= target]
+            if not part.empty:
+                d = min(part["Date"])
+                snap = part[part["Date"] == d].copy()
+                snap = snap[snap["Market"].isin(["KOSPI", "KOSDAQ"])]
+                return d, snap
+        raise RuntimeError(f"No Marcap trading day on/after {target}")
+
+    def first_price_on_or_after(self, ticker: str, target: date, days: int = 20) -> tuple[float, date] | None:
+        end = target + timedelta(days=days)
+        frames = []
+        for year in range(target.year, end.year + 1):
+            df = self.year(year)
+            part = df[
+                (df["Code"] == ticker)
+                & (df["Date"] >= target)
+                & (df["Date"] <= end)
+            ]
+            if not part.empty:
+                frames.append(part)
+        if not frames:
+            return None
+        x = pd.concat(frames).sort_values("Date").iloc[0]
+        return float(x["Close"]), x["Date"]
+
+    def last_price_on_or_before(self, ticker: str, start: date, target: date) -> tuple[float, date] | None:
+        for year in range(target.year, start.year - 1, -1):
+            df = self.year(year)
+            part = df[
+                (df["Code"] == ticker)
+                & (df["Date"] >= start)
+                & (df["Date"] <= target)
+            ]
+            if not part.empty:
+                x = part.sort_values("Date").iloc[-1]
+                return float(x["Close"]), x["Date"]
+        return None
+
+
+def _normalize_corp_name(name: str) -> str:
+    s = str(name or "").strip()
+    for token in ("주식회사", "(주)", "㈜"):
+        s = s.replace(token, "")
+    return "".join(s.split()).lower()
+
 def filing_date(rows: list[dict] | None) -> date | None:
     if not rows:
         return None
@@ -231,42 +321,38 @@ def require_pit(rows: list[dict] | None, asof: date, label: str) -> None:
     assert_point_in_time(fd, asof)
 
 
-def first_trading_day_on_or_after(year: int, month: int = 6, day: int = 1) -> date:
-    d = date(year, month, day)
-    for offset in range(0, 15):
-        cur = d + timedelta(days=offset)
-        ds = cur.strftime("%Y%m%d")
-        try:
-            frame = _retry(lambda: stock.get_market_cap_by_ticker(ds, market="ALL"), attempts=3)
-            if frame is not None and not frame.empty:
-                return cur
-        except Exception:
-            pass
-    raise RuntimeError(f"No KRX trading day found after {d}")
+def first_trading_day_on_or_after(marcap: MarcapStore, year: int, month: int = 6, day: int = 1) -> date:
+    d, _ = marcap.snapshot_on_or_after(date(year, month, day))
+    return d
 
 
-def market_cap_snapshot(asof: date) -> tuple[dict[str, dict], dict[str, str]]:
-    ds = asof.strftime("%Y%m%d")
+def market_cap_snapshot(marcap: MarcapStore, asof: date) -> tuple[dict[str, dict], dict[str, str]]:
+    actual, frame = marcap.snapshot_on_or_after(asof)
+    if actual != asof:
+        raise RuntimeError(f"Marcap snapshot resolved to {actual}, expected {asof}")
+
     result = {}
     markets = {}
-    for market in ("KOSPI", "KOSDAQ"):
-        frame = _retry(lambda m=market: stock.get_market_cap_by_ticker(ds, market=m), attempts=4)
-        if frame is None or frame.empty:
+    for _, row in frame.iterrows():
+        ticker = str(row["Code"]).zfill(6)
+        cap = _to_number(row.get("Marcap"))
+        shares = _to_number(row.get("Stocks"))
+        close = _to_number(row.get("Close"))
+        market = str(row.get("Market") or "")
+        # FinanceData/marcap stores raw KRW market cap (not millions) in current parquet data.
+        if cap is None or cap <= 0 or close is None or close <= 0:
             continue
-        for ticker, row in frame.iterrows():
-            cap = _to_number(row.get("시가총액"))
-            shares = _to_number(row.get("상장주식수"))
-            if cap is None or cap <= 0:
-                continue
-            result[str(ticker)] = {
-                "ticker": str(ticker),
-                "market_cap": cap,
-                "listed_shares": shares,
-                "market": market,
-            }
-            markets[str(ticker)] = market
+        result[ticker] = {
+            "ticker": ticker,
+            "name": str(row.get("Name") or ""),
+            "market_cap": cap,
+            "listed_shares": shares,
+            "close": close,
+            "market": market,
+        }
+        markets[ticker] = market
     if not result:
-        raise RuntimeError(f"KRX market-cap snapshot is empty for {asof}")
+        raise RuntimeError(f"Marcap market-cap snapshot is empty for {asof}")
     return result, markets
 
 
@@ -277,7 +363,7 @@ def build_corp_maps(corps: list[dict]) -> tuple[dict[str, dict], dict[str, dict]
         if r.get("stock_code"):
             by_stock[r["stock_code"]] = r
         if r.get("corp_name"):
-            by_name[r["corp_name"]] = r
+            by_name[_normalize_corp_name(r["corp_name"])] = r
     return by_stock, by_name
 
 
@@ -445,68 +531,74 @@ def snapshot_score(
     }
 
 
-def _ohlcv(ticker: str, start: date, end: date):
-    return _retry(
-        lambda: stock.get_market_ohlcv_by_date(
-            start.strftime("%Y%m%d"),
-            end.strftime("%Y%m%d"),
-            ticker,
-            adjusted=True,
-        ),
-        attempts=4,
-    )
-
-
-def start_price(ticker: str, asof: date) -> tuple[float, date]:
-    frame = _ohlcv(ticker, asof, asof + timedelta(days=14))
-    if frame is None or frame.empty:
+def start_price(marcap: MarcapStore, ticker: str, asof: date) -> tuple[float, date]:
+    found = marcap.first_price_on_or_after(ticker, asof, days=20)
+    if not found:
         raise ValueError("entry price unavailable")
-    row = frame.iloc[0]
-    px = float(row["종가"])
-    dt = frame.index[0].date() if hasattr(frame.index[0], "date") else asof
-    return px, dt
+    return found
 
 
-def terminal_price(ticker: str, start: date, target: date) -> tuple[float, date, str]:
-    # Standard case: first trading day on/after the anniversary.
-    frame = _ohlcv(ticker, target, target + timedelta(days=14))
-    if frame is not None and not frame.empty:
-        px = float(frame.iloc[0]["종가"])
-        dt = frame.index[0].date() if hasattr(frame.index[0], "date") else target
+def terminal_price(marcap: MarcapStore, ticker: str, start: date, target: date) -> tuple[float, date, str]:
+    found = marcap.first_price_on_or_after(ticker, target, days=20)
+    if found:
+        px, dt = found
         return px, dt, "target_or_next_trading_day"
 
-    # Delisted / suspended names must never be silently dropped. Use their last
-    # available traded close up to the target and label the observation.
-    frame = _ohlcv(ticker, start, target)
-    if frame is None or frame.empty:
+    # Delisted / suspended names are never silently removed.
+    found = marcap.last_price_on_or_before(ticker, start, target)
+    if not found:
         raise ValueError("no terminal or historical price")
-    px = float(frame.iloc[-1]["종가"])
-    dt = frame.index[-1].date() if hasattr(frame.index[-1], "date") else target
+    px, dt = found
     return px, dt, "last_available_before_target"
 
 
-def benchmark_code(market: str) -> str:
-    return "1001" if market == "KOSPI" else "2001"
+def benchmark_symbol(market: str) -> str:
+    return "^KS11" if market == "KOSPI" else "^KQ11"
 
 
-def index_price(index_code: str, target: date, start_side: bool) -> tuple[float, date]:
-    if start_side:
-        begin, end = target, target + timedelta(days=14)
-    else:
-        begin, end = target - timedelta(days=14), target + timedelta(days=14)
-    frame = _retry(
-        lambda: stock.get_index_ohlcv_by_date(
-            begin.strftime("%Y%m%d"),
-            end.strftime("%Y%m%d"),
-            index_code,
-        ),
-        attempts=4,
-    )
-    if frame is None or frame.empty:
-        raise ValueError("benchmark price unavailable")
-    row = frame.iloc[0] if start_side else frame.iloc[-1]
-    idx = frame.index[0] if start_side else frame.index[-1]
-    return float(row["종가"]), idx.date() if hasattr(idx, "date") else target
+def yahoo_index_price(symbol: str, target: date, on_or_after: bool) -> tuple[float, date] | None:
+    start = target - timedelta(days=10) if not on_or_after else target
+    end = target + timedelta(days=15)
+    params = {
+        "period1": int(datetime.combine(start, datetime.min.time()).timestamp()),
+        "period2": int(datetime.combine(end, datetime.min.time()).timestamp()),
+        "interval": "1d",
+        "events": "history",
+    }
+
+    def call():
+        r = requests.get(
+            YAHOO_CHART.format(symbol=symbol),
+            params=params,
+            headers={"User-Agent": "Mozilla/5.0 lattice-stock-analyzer-backtest"},
+            timeout=(4, 15),
+        )
+        r.raise_for_status()
+        return r.json()
+
+    try:
+        data = _retry(call, attempts=3)
+        result = data["chart"]["result"][0]
+        timestamps = result.get("timestamp") or []
+        closes = result.get("indicators", {}).get("adjclose", [{}])[0].get("adjclose")
+        if not closes:
+            closes = result.get("indicators", {}).get("quote", [{}])[0].get("close") or []
+        pairs = []
+        for ts, px in zip(timestamps, closes):
+            if px is None:
+                continue
+            d = datetime.utcfromtimestamp(ts).date()
+            pairs.append((d, float(px)))
+        if not pairs:
+            return None
+        pairs.sort()
+        if on_or_after:
+            eligible = [x for x in pairs if x[0] >= target]
+            return (eligible[0][1], eligible[0][0]) if eligible else None
+        eligible = [x for x in pairs if x[0] <= target]
+        return (eligible[-1][1], eligible[-1][0]) if eligible else None
+    except Exception:
+        return None
 
 
 def completed_target(asof: date, years: int, today: date) -> date | None:
@@ -538,8 +630,9 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 def run(args):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     dart = DartCache(os.environ.get("DART_API_KEY", ""))
+    marcap = MarcapStore()
     corps = dart.corp_codes()
-    by_stock, _ = build_corp_maps(corps)
+    by_stock, by_name = build_corp_maps(corps)
     today = date.today()
 
     all_rank_rows = []
@@ -547,8 +640,8 @@ def run(args):
     cohort_audits = []
 
     for year in range(args.start_year, args.end_year + 1):
-        asof = first_trading_day_on_or_after(year)
-        cap_snapshot, _ = market_cap_snapshot(asof)
+        asof = first_trading_day_on_or_after(marcap, year)
+        cap_snapshot, _ = market_cap_snapshot(marcap, asof)
 
         liquid = sorted(
             cap_snapshot.values(),
@@ -560,6 +653,8 @@ def run(args):
         seen_corps = set()
         for row in liquid:
             corp = by_stock.get(row["ticker"])
+            if not corp:
+                corp = by_name.get(_normalize_corp_name(row.get("name")))
             if not corp:
                 continue
             if corp["corp_code"] in seen_corps:
@@ -619,18 +714,23 @@ def run(args):
         benchmark_starts = {}
         for row in ranked:
             ticker = row["ticker"]
-            entry, entry_date = start_price(ticker, asof)
-            bcode = benchmark_code(row["market"])
-            if bcode not in benchmark_starts:
-                benchmark_starts[bcode] = index_price(bcode, entry_date, True)[0]
+            entry, entry_date = start_price(marcap, ticker, asof)
+            bsym = benchmark_symbol(row["market"])
+            if bsym not in benchmark_starts:
+                b_start = yahoo_index_price(bsym, entry_date, True)
+                benchmark_starts[bsym] = b_start[0] if b_start else None
             for horizon in HORIZONS:
                 target = completed_target(entry_date, horizon, today)
                 if target is None:
                     continue
-                end_px, end_date, terminal_source = terminal_price(ticker, entry_date, target)
-                b_end, _ = index_price(bcode, target, False)
+                end_px, end_date, terminal_source = terminal_price(marcap, ticker, entry_date, target)
+                b_end = yahoo_index_price(bsym, target, False)
                 ret = end_px / entry - 1.0
-                bret = b_end / benchmark_starts[bcode] - 1.0
+                bret = (
+                    b_end[0] / benchmark_starts[bsym] - 1.0
+                    if b_end and benchmark_starts.get(bsym)
+                    else None
+                )
                 observations.append(
                     Observation(
                         cohort_year=year,
@@ -658,7 +758,7 @@ def run(args):
 
     payload = {
         "generated_at": datetime.utcnow().isoformat() + "Z",
-        "methodology_version": "pit-kr-v0.1",
+        "methodology_version": "pit-kr-v0.2-marcap",
         "parameters": vars(args),
         "cohort_audits": cohort_audits,
         **summary,
