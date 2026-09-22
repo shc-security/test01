@@ -2131,22 +2131,48 @@ def analyze_kr(q):
             "잘못된 TTM 점수 대신 분석을 중단했습니다."
         )
 
-    # Share count is fetched after the financial bridge succeeds; a failed
-    # valuation fetch must not corrupt quality calculations.
-    shares = None
+    # Share structure is fetched after the financial bridge succeeds. For
+    # valuation, ordinary and preferred equity classes must all be included.
+    share_structure = None
     share_year = interim_year if interim_code else latest_year
     share_code = interim_code if interim_code else "11011"
     try:
-        shares = _dart_share_count(company["corp_code"], share_year, share_code)
+        share_structure = _dart_share_structure(company["corp_code"], share_year, share_code)
     except Exception:
-        shares = None
-    if shares is None and share_year != latest_year:
+        share_structure = None
+    if not share_structure and share_year != latest_year:
         try:
-            shares = _dart_share_count(company["corp_code"], latest_year, "11011")
+            share_structure = _dart_share_structure(company["corp_code"], latest_year, "11011")
         except Exception:
-            shares = None
+            share_structure = None
 
+    shares = share_structure.get("common_shares") if share_structure else None
     price = p.get("price") if p else None
+
+    equity_market_cap = None
+    enterprise_value = None
+    preferred_value = 0.0
+    preferred_details = []
+    preferred_coverage_complete = True
+
+    if price and shares:
+        common_value = price * shares
+        preferred_classes = (
+            share_structure.get("preferred_classes") or []
+            if share_structure else []
+        )
+        if preferred_classes:
+            preferred_value, preferred_details, preferred_coverage_complete = (
+                _kr_preferred_market_cap(company["stock_code"], preferred_classes)
+            )
+        if preferred_coverage_complete and preferred_value is not None:
+            equity_market_cap = common_value + preferred_value
+
+        balance_for_ev = current or annual_latest
+        debt_now = balance_for_ev.get("debt") if balance_for_ev else None
+        cash_now = balance_for_ev.get("cash") if balance_for_ev else None
+        if equity_market_cap and debt_now is not None and cash_now is not None:
+            enterprise_value = equity_market_cap + debt_now - cash_now
     industry_code = company_info.get("induty_code")
     sector = _sector_from_kr_industry(industry_code)
     industry = {
@@ -2163,7 +2189,21 @@ def analyze_kr(q):
         shares=shares,
         current=current,
         industry=industry,
+        equity_market_cap=equity_market_cap,
+        enterprise_value=enterprise_value,
     )
+
+    peer_symbol = p.get("symbol") if p else None
+    peer_target = {
+        "roic": result["metrics"].get("roic_proxy"),
+        "margin": result["metrics"].get("operating_margin"),
+        "growth": result["metrics"].get("recent_revenue_cagr") or result["metrics"].get("revenue_cagr"),
+        "fcf_margin": result["metrics"].get("fcf_margin"),
+    }
+    peer_relative = _actual_peer_relative_score(peer_symbol, peer_target, 0.24)
+    if peer_relative:
+        result["industry_percentile"] = peer_relative["score"]
+        result["peer_relative"] = peer_relative
     result.update(
         {
             "market": "KR",
@@ -2172,6 +2212,12 @@ def analyze_kr(q):
             "corp_code": company["corp_code"],
             "price": p,
             "shares_approx": shares,
+            "share_structure": share_structure,
+            "preferred_market_cap": preferred_value,
+            "preferred_share_details": preferred_details,
+            "preferred_coverage_complete": preferred_coverage_complete,
+            "equity_market_cap": equity_market_cap,
+            "enterprise_value": enterprise_value,
             "annual_base_year": latest_year,
             "fs_div_by_year": fs_used,
             "interim_report": {
