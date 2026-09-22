@@ -21,8 +21,8 @@ jobs:
         run: |
           mkdir -p data
           curl --fail --retry 3 --retry-delay 2 \
-            -A "lattice-stock-analyzer/0.3.5 contact:https://github.com/shc-security/test01" \
-            "https://www.sec.gov/files/company_tickers.json" \
+            -A "Mozilla/5.0 lattice-stock-analyzer" \
+            "https://raw.githubusercontent.com/lwowlwowl/company_name_to_ticker/main/company_tickers.json" \
             -o /tmp/company_tickers.json
 
       - name: Convert to compact ticker map
