@@ -77,7 +77,7 @@ jobs:
           retention-days: 14
 
   full:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[full-backtest]')
     needs: unit
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -99,15 +99,15 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: backtest/.cache
-          key: lfs-pit-dart-v1-${{ inputs.start_year }}-${{ inputs.end_year }}
+          key: lfs-pit-dart-v1-${{ inputs.start_year || '2016' }}-${{ inputs.end_year || '2025' }}
           restore-keys: |
             lfs-pit-dart-v1-
       - name: Run point-in-time backtest
         run: >-
           python backtest/kr_point_in_time.py
-          --start-year ${{ inputs.start_year }}
-          --end-year ${{ inputs.end_year }}
-          --universe-size ${{ inputs.universe_size }}
+          --start-year ${{ inputs.start_year || '2016' }}
+          --end-year ${{ inputs.end_year || '2025' }}
+          --universe-size ${{ inputs.universe_size || '100' }}
           --top-n 10
           --min-mapping-coverage 0.95
           --min-score-coverage 0.80
