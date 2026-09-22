@@ -153,14 +153,14 @@ def _dart_annual_rows(corp_code, year):
     return None, None
 
 
-def _row_value(rows, ids=(), names=(), sj=None):
+def _row_value(rows, ids=(), names=(), sj=None, amount_key="thstrm_amount"):
     # Prefer standardized account ids.
     for aid in ids:
         for r in rows:
             if sj and r.get("sj_div") != sj:
                 continue
             if (r.get("account_id") or "") == aid:
-                v = _jnum(r.get("thstrm_amount"))
+                v = _jnum(r.get(amount_key))
                 if v is not None:
                     return v
 
@@ -171,60 +171,68 @@ def _row_value(rows, ids=(), names=(), sj=None):
         nm = (r.get("account_nm") or "").lower().replace(" ", "")
         for n in names_l:
             if n.replace(" ", "") in nm:
-                v = _jnum(r.get("thstrm_amount"))
+                v = _jnum(r.get(amount_key))
                 if v is not None:
                     return v
     return None
 
 
-def _dart_metrics_from_rows(rows):
+def _dart_metrics_from_rows(rows, amount_key="thstrm_amount"):
     revenue = _row_value(
         rows,
         ids=("ifrs-full_Revenue", "ifrs-full_RevenueFromContractsWithCustomers"),
         names=("매출액", "영업수익", "수익(매출액)"),
         sj="IS",
+        amount_key=amount_key,
     )
     op_income = _row_value(
         rows,
         ids=("dart_OperatingIncomeLoss",),
         names=("영업이익", "영업이익(손실)"),
         sj="IS",
+        amount_key=amount_key,
     )
     net_income = _row_value(
         rows,
         ids=("ifrs-full_ProfitLoss",),
         names=("당기순이익", "당기순이익(손실)", "연결당기순이익"),
         sj="IS",
+        amount_key=amount_key,
     )
     assets = _row_value(
         rows,
         ids=("ifrs-full_Assets",),
         names=("자산총계",),
         sj="BS",
+        amount_key=amount_key,
     )
     equity = _row_value(
         rows,
         ids=("ifrs-full_Equity",),
         names=("자본총계",),
         sj="BS",
+        amount_key=amount_key,
     )
     cash = _row_value(
         rows,
         ids=("ifrs-full_CashAndCashEquivalents",),
         names=("현금및현금성자산",),
         sj="BS",
+        amount_key=amount_key,
     )
     cfo = _row_value(
         rows,
         ids=("ifrs-full_CashFlowsFromUsedInOperatingActivities",),
         names=("영업활동현금흐름", "영업활동으로인한현금흐름"),
         sj="CF",
+        amount_key=amount_key,
     )
     capex = _row_value(
         rows,
         ids=("ifrs-full_PurchaseOfPropertyPlantAndEquipment",),
         names=("유형자산의취득", "유형자산 취득"),
         sj="CF",
+        amount_key=amount_key,
     )
     if capex is not None:
         capex = abs(capex)
@@ -242,7 +250,7 @@ def _dart_metrics_from_rows(rows):
     for r in rows:
         aid = r.get("account_id") or ""
         if r.get("sj_div") == "BS" and aid in debt_ids and aid not in seen_ids:
-            v = _jnum(r.get("thstrm_amount"))
+            v = _jnum(r.get(amount_key))
             if v is not None:
                 debt_vals.append(v)
                 seen_ids.add(aid)
@@ -620,43 +628,83 @@ def _compute_lfs(series, tax_rate, price=None, shares=None):
 
 def analyze_kr(q):
     company = _resolve_kr_company(q)
-    current_year = datetime.utcnow().year
-    years = list(range(current_year - 1, current_year - 7, -1))
-    rows = []
-    fs_used = {}
+    latest_year = datetime.utcnow().year - 1
 
-    # DART 연도별 공시는 서로 독립이므로 병렬 조회해 Vercel 대기시간을 줄인다.
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        jobs = {ex.submit(_dart_annual_rows, company["corp_code"], year): year for year in years}
+    # 연간 공시 1건에는 당기/전기/전전기 값이 같이 들어온다.
+    # 따라서 최신연도와 3년 전 공시만 가져오면 최대 6개 연도를 만들 수 있다.
+    requested_years = [latest_year, latest_year - 3]
+    raw_sets = {}
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        jobs = {ex.submit(_dart_annual_rows, company["corp_code"], y): y for y in requested_years}
         for future in as_completed(jobs):
-            year = jobs[future]
+            y = jobs[future]
             try:
                 raw, fs_div = future.result()
+            except Exception:
+                raw, fs_div = None, None
+            if raw:
+                raw_sets[y] = (raw, fs_div)
+
+    rows_by_year = {}
+    fs_used = {}
+
+    for report_year, payload in raw_sets.items():
+        raw, fs_div = payload
+        for offset, amount_key in (
+            (0, "thstrm_amount"),
+            (1, "frmtrm_amount"),
+            (2, "bfefrmtrm_amount"),
+        ):
+            y = report_year - offset
+            if y in rows_by_year:
+                continue
+            m = _dart_metrics_from_rows(raw, amount_key=amount_key)
+            # 핵심 손익 값이 둘 다 있어야 유효한 연도로 본다.
+            if m.get("revenue") is None or m.get("operating_income") is None:
+                continue
+            m["year"] = y
+            rows_by_year[y] = m
+            fs_used[y] = fs_div
+
+    rows = [rows_by_year[y] for y in sorted(rows_by_year)]
+    rows = rows[-5:]
+
+    if len(rows) < 2:
+        # 드물게 비교열이 비어 있는 공시가 있으면 개별 연도 조회로 보완한다.
+        fallback_years = list(range(latest_year, latest_year - 6, -1))
+        for y in fallback_years:
+            if y in rows_by_year:
+                continue
+            try:
+                raw, fs_div = _dart_annual_rows(company["corp_code"], y)
             except Exception:
                 continue
             if raw:
                 m = _dart_metrics_from_rows(raw)
-                m["year"] = year
-                rows.append(m)
-                fs_used[year] = fs_div
+                if m.get("revenue") is not None and m.get("operating_income") is not None:
+                    m["year"] = y
+                    rows_by_year[y] = m
+                    fs_used[y] = fs_div
+            if len(rows_by_year) >= 5:
+                break
+        rows = [rows_by_year[y] for y in sorted(rows_by_year)][-5:]
 
-    rows.sort(key=lambda x: x["year"])
-    rows = rows[-5:]
     if len(rows) < 2:
         raise RuntimeError("OpenDART에서 LFS 계산에 필요한 최근 연간 재무제표를 충분히 찾지 못했습니다.")
 
-    latest_year = rows[-1]["year"]
+    latest_data_year = rows[-1]["year"]
 
-    # 주식수와 무료 가격 데이터도 병렬 조회한다. 가격 실패는 분석 자체를 막지 않는다.
+    # 주식수와 무료 가격 데이터는 병렬 조회한다.
     with ThreadPoolExecutor(max_workers=2) as ex:
-        share_job = ex.submit(_dart_share_count, company["corp_code"], latest_year)
+        share_job = ex.submit(_dart_share_count, company["corp_code"], latest_data_year)
         price_job = ex.submit(_kr_price, company["stock_code"]) if company["stock_code"] else None
         try:
-            shares = share_job.result()
+            shares = share_job.result(timeout=10)
         except Exception:
             shares = None
         try:
-            p = price_job.result() if price_job else None
+            p = price_job.result(timeout=8) if price_job else None
         except Exception:
             p = None
 
