@@ -924,6 +924,168 @@ def _yahoo_annual_rows(symbol):
     )
     return rows, current, shares
 
+
+def _yahoo_recommended_peers(symbol, max_peers=5):
+    if not symbol:
+        return []
+    url = f"https://query2.finance.yahoo.com/v6/finance/recommendationsbysymbol/{symbol}"
+    try:
+        data = _http_get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; lattice-stock-analyzer/1.0)"},
+            timeout=(2, 5),
+        ).json()
+        result = data.get("finance", {}).get("result") or []
+        if not result:
+            return []
+        peers = []
+        for item in result[0].get("recommendedSymbols") or []:
+            s = str(item.get("symbol") or "").strip()
+            if s and s != symbol and s not in peers:
+                peers.append(s)
+            if len(peers) >= max_peers:
+                break
+        return peers
+    except Exception:
+        return []
+
+
+def _yahoo_peer_quality_metrics(symbol, tax_rate):
+    fields = (
+        "annualTotalRevenue",
+        "annualOperatingIncome",
+        "annualTotalAssets",
+        "annualStockholdersEquity",
+        "annualCashAndCashEquivalents",
+        "annualCashCashEquivalentsAndShortTermInvestments",
+        "annualTotalDebt",
+        "annualOperatingCashFlow",
+        "annualCapitalExpenditure",
+    )
+    now_ts = int(datetime.utcnow().timestamp()) + 86400
+    start_ts = int(datetime(2019, 1, 1).timestamp())
+    try:
+        data = _http_get(
+            YAHOO_FUNDAMENTALS.format(symbol),
+            params={
+                "symbol": symbol,
+                "type": ",".join(fields),
+                "period1": start_ts,
+                "period2": now_ts,
+            },
+            headers={"User-Agent": "Mozilla/5.0 (compatible; lattice-stock-analyzer/1.0)"},
+            timeout=(2, 6),
+        ).json()
+    except Exception:
+        return None
+
+    ts = _yahoo_ts_map(data)
+
+    def series(key_options):
+        for key in key_options:
+            vals = ts.get(key) or []
+            if vals:
+                return vals
+        return []
+
+    revenue = series(("annualTotalRevenue",))
+    op = series(("annualOperatingIncome",))
+    assets = series(("annualTotalAssets",))
+    equity = series(("annualStockholdersEquity",))
+    cash = series(("annualCashAndCashEquivalents", "annualCashCashEquivalentsAndShortTermInvestments"))
+    debt = series(("annualTotalDebt",))
+    cfo = series(("annualOperatingCashFlow",))
+    capex = series(("annualCapitalExpenditure",))
+
+    def latest(vals):
+        return vals[-1]["value"] if vals else None
+
+    rev = latest(revenue)
+    opi = latest(op)
+    ast = latest(assets)
+    eq = latest(equity)
+    ca = latest(cash)
+    de = latest(debt)
+    cf = latest(cfo)
+    cx = latest(capex)
+
+    if rev is None or opi is None:
+        return None
+
+    invested = None
+    if eq is not None and de is not None and ca is not None:
+        invested = eq + de - ca
+    elif ast is not None and ca is not None:
+        invested = ast - ca
+
+    roic = (
+        opi * (1 - tax_rate) / invested
+        if invested is not None and invested > 0 else None
+    )
+    margin = opi / rev if rev else None
+    fcf_margin = (
+        (cf - abs(cx)) / rev
+        if cf is not None and cx is not None and rev else None
+    )
+
+    growth = None
+    if len(revenue) >= 4:
+        first = revenue[-4]
+        last = revenue[-1]
+        try:
+            years = max(1, int(last["date"][:4]) - int(first["date"][:4]))
+        except Exception:
+            years = 3
+        growth = _cagr(first["value"], last["value"], years)
+
+    return {
+        "symbol": symbol,
+        "roic": roic,
+        "margin": margin,
+        "growth": growth,
+        "fcf_margin": fcf_margin,
+    }
+
+
+def _actual_peer_relative_score(symbol, target, tax_rate):
+    peers = _yahoo_recommended_peers(symbol, max_peers=5)
+    if not peers:
+        return None
+
+    rows = []
+    with ThreadPoolExecutor(max_workers=min(5, len(peers))) as ex:
+        jobs = {ex.submit(_yahoo_peer_quality_metrics, p, tax_rate): p for p in peers}
+        for future in as_completed(jobs):
+            try:
+                m = future.result()
+            except Exception:
+                m = None
+            if m:
+                rows.append(m)
+
+    if len(rows) < 3:
+        return None
+
+    percentiles = []
+    for key in ("roic", "margin", "growth", "fcf_margin"):
+        tv = target.get(key)
+        vals = [r.get(key) for r in rows if r.get(key) is not None]
+        if tv is None or len(vals) < 3:
+            continue
+        below_or_equal = sum(1 for v in vals if v <= tv)
+        p = 100.0 * (below_or_equal + 1) / (len(vals) + 1)
+        percentiles.append(p)
+
+    if not percentiles:
+        return None
+
+    return {
+        "score": round(sum(percentiles) / len(percentiles), 1),
+        "sample_size": len(rows),
+        "peers": sorted(r["symbol"] for r in rows),
+        "metric_count": len(percentiles),
+    }
+
 def _sec_headers():
     ua = os.getenv("SEC_USER_AGENT", "").strip() or "lattice-stock-analyzer/1.0"
     return {"User-Agent": ua, "Accept-Encoding": "gzip, deflate"}
