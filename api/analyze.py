@@ -4,6 +4,7 @@ import os
 import statistics
 import zipfile
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -65,8 +66,9 @@ def _cagr(start, end, periods):
 
 def _http_get(url, **kwargs):
     headers = kwargs.pop("headers", {})
+    timeout = kwargs.pop("timeout", (5, 10))
     headers.setdefault("User-Agent", "lattice-stock-analyzer/1.0")
-    r = requests.get(url, headers=headers, timeout=20, **kwargs)
+    r = requests.get(url, headers=headers, timeout=timeout, **kwargs)
     r.raise_for_status()
     return r
 
@@ -280,6 +282,7 @@ def _yahoo_price(symbol):
             YAHOO_CHART.format(symbol),
             params={"range": "5d", "interval": "1d"},
             headers={"User-Agent": "Mozilla/5.0 lattice-stock-analyzer"},
+            timeout=(2, 3),
         ).json()
         result = data.get("chart", {}).get("result", [None])[0]
         if not result:
@@ -618,24 +621,45 @@ def _compute_lfs(series, tax_rate, price=None, shares=None):
 def analyze_kr(q):
     company = _resolve_kr_company(q)
     current_year = datetime.utcnow().year
+    years = list(range(current_year - 1, current_year - 7, -1))
     rows = []
     fs_used = {}
-    for year in range(current_year - 1, current_year - 7, -1):
-        raw, fs_div = _dart_annual_rows(company["corp_code"], year)
-        if raw:
-            m = _dart_metrics_from_rows(raw)
-            m["year"] = year
-            rows.append(m)
-            fs_used[year] = fs_div
-        if len(rows) >= 5:
-            break
+
+    # DART 연도별 공시는 서로 독립이므로 병렬 조회해 Vercel 대기시간을 줄인다.
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        jobs = {ex.submit(_dart_annual_rows, company["corp_code"], year): year for year in years}
+        for future in as_completed(jobs):
+            year = jobs[future]
+            try:
+                raw, fs_div = future.result()
+            except Exception:
+                continue
+            if raw:
+                m = _dart_metrics_from_rows(raw)
+                m["year"] = year
+                rows.append(m)
+                fs_used[year] = fs_div
+
     rows.sort(key=lambda x: x["year"])
-    if not rows:
-        raise RuntimeError("OpenDART에서 최근 사업보고서 재무제표를 찾지 못했습니다.")
+    rows = rows[-5:]
+    if len(rows) < 2:
+        raise RuntimeError("OpenDART에서 LFS 계산에 필요한 최근 연간 재무제표를 충분히 찾지 못했습니다.")
 
     latest_year = rows[-1]["year"]
-    shares = _dart_share_count(company["corp_code"], latest_year)
-    p = _kr_price(company["stock_code"]) if company["stock_code"] else None
+
+    # 주식수와 무료 가격 데이터도 병렬 조회한다. 가격 실패는 분석 자체를 막지 않는다.
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        share_job = ex.submit(_dart_share_count, company["corp_code"], latest_year)
+        price_job = ex.submit(_kr_price, company["stock_code"]) if company["stock_code"] else None
+        try:
+            shares = share_job.result()
+        except Exception:
+            shares = None
+        try:
+            p = price_job.result() if price_job else None
+        except Exception:
+            p = None
+
     price = p.get("price") if p else None
 
     result = _compute_lfs(rows, tax_rate=0.24, price=price, shares=shares)
