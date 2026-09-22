@@ -103,9 +103,9 @@
           <small>최근 여러 해의 중앙값과 지속성을 반영해 일시적인 호황·불황의 영향을 줄입니다.</small>
         </div>
         <div class="summary">
-          <span class="muted">업종 기준 상대점수</span>
+          <span class="muted">유사기업 상대점수</span>
           <b id="industryRank">-</b>
-          <small>같은 업종의 일반적인 기준과 비교한 0~100 참고점수입니다. 실제 전 종목 순위는 아닙니다.</small>
+          <small id="peerNote">실제 유사기업 표본과 자본효율성·이익률·성장률·현금흐름을 비교합니다.</small>
         </div>
       </div>
       <div id="dataWarning" class="score-note hidden" style="max-width:none;margin-top:12px"></div>
@@ -241,9 +241,21 @@ document.getElementById("go").onclick = async function() {
     document.getElementById("longScore").textContent = d.normalized_score.toFixed(1) + " / 100";
     document.getElementById("industryRank").textContent =
       d.industry_percentile == null ? "-" : d.industry_percentile.toFixed(1) + " / 100";
+    var peerNote = document.getElementById("peerNote");
+    if (d.peer_relative && d.peer_relative.sample_size) {
+      peerNote.textContent =
+        "실제 유사기업 " + d.peer_relative.sample_size + "개 표본과 비교했습니다: " +
+        (d.peer_relative.peers || []).join(", ");
+    } else {
+      peerNote.textContent =
+        "유사기업 실시간 표본을 충분히 확보하지 못해 업종 기준분포를 보조적으로 사용했습니다.";
+    }
 
     var dataWarning = document.getElementById("dataWarning");
-    var warnings = d.data_quality && d.data_quality.warnings ? d.data_quality.warnings : [];
+    var warnings = d.data_quality && d.data_quality.warnings ? d.data_quality.warnings.slice() : [];
+    if (d.market === "KR" && d.preferred_coverage_complete === false) {
+      warnings.push("우선주 가격을 모두 확인하지 못해 가격 매력도 계산에서 전체 지분가치를 확정하지 못했습니다.");
+    }
     if (warnings.length) {
       dataWarning.innerHTML = "<b>데이터 참고</b><br>" + warnings.join("<br>");
       dataWarning.classList.remove("hidden");
@@ -291,7 +303,7 @@ document.getElementById("go").onclick = async function() {
       d.current_valuation_score == null ? "계산 불가" : d.current_valuation_score.toFixed(1) + " / 15",
       d.current_valuation_score == null
         ? "주식수나 가격 데이터가 부족해 가격 평가를 제외했습니다."
-        : "현재 주가가 기업의 이익과 잉여현금흐름에 비해 어느 정도 부담스러운지 평가한 점수입니다. 높을수록 가격 부담이 낮습니다."
+        : "본업의 세후 이익은 부채와 현금을 반영한 기업 전체가치와 비교하고, 잉여현금흐름은 보통주·우선주를 포함한 전체 지분가치와 비교합니다. 높을수록 가격 부담이 낮습니다."
     );
 
     var labels = {
@@ -323,7 +335,7 @@ document.getElementById("go").onclick = async function() {
       "<td><b>가격 매력도</b></td>" +
       "<td><b>" + (d.current_valuation_score == null ? "계산 불가" : d.current_valuation_score.toFixed(1) + " / 15") + "</b></td>" +
       "<td><b>" + (d.normalized_valuation_score == null ? "계산 불가" : d.normalized_valuation_score.toFixed(1) + " / 15") + "</b></td>" +
-      '<td class="explain">현재 주가가 이익과 잉여현금흐름에 비해 얼마나 비싼지 또는 싼지 평가합니다.</td>';
+      '<td class="explain">본업 이익은 기업 전체가치와, 잉여현금흐름은 보통주·우선주 전체 지분가치와 비교해 가격 부담을 평가합니다.</td>';
     tbody.appendChild(trv);
 
     var raw = document.getElementById("rawData");
@@ -334,6 +346,8 @@ document.getElementById("go").onclick = async function() {
     addRaw(raw, "최근 12개월 영업현금흐름", money(d.metrics.current_cfo, d.market));
     addRaw(raw, "최근 12개월 설비투자", money(d.metrics.current_capex, d.market));
     addRaw(raw, "최근 12개월 잉여현금흐름", money(d.metrics.current_fcf, d.market));
+    addRaw(raw, "전체 지분가치", money(d.metrics.market_cap_approx, d.market));
+    addRaw(raw, "기업 전체가치(지분가치+순부채)", money(d.metrics.enterprise_value_approx, d.market));
 
     result.classList.remove("hidden");
     status.textContent = "완료 · 최신 공시 기준";
