@@ -411,14 +411,29 @@ def _dart_metrics_from_rows(
     cfo = _row_value(
         rows,
         ids=("ifrs-full_CashFlowsFromUsedInOperatingActivities",),
-        names=("영업활동현금흐름", "영업활동으로인한현금흐름"),
+        names=(
+            "영업활동현금흐름",
+            "영업활동으로인한현금흐름",
+            "영업활동 현금흐름",
+            "영업활동으로 인한 현금흐름",
+            "영업활동에서창출된현금흐름",
+            "영업활동에서 창출된 현금흐름",
+        ),
         sj="CF",
         amount_key=cash_key,
     )
     capex = _row_value(
         rows,
         ids=("ifrs-full_PurchaseOfPropertyPlantAndEquipment",),
-        names=("유형자산의취득", "유형자산 취득", "유형자산취득"),
+        names=(
+            "유형자산의취득",
+            "유형자산 취득",
+            "유형자산취득",
+            "유형자산의 취득",
+            "유형자산의취득으로인한현금유출",
+            "유형자산의 취득으로 인한 현금유출",
+            "유형자산취득으로인한현금유출",
+        ),
         sj="CF",
         amount_key=cash_key,
     )
@@ -477,11 +492,23 @@ def _dart_interim_ttm(
         current_income_key = "thstrm_amount"
         prior_income_key = "frmtrm_amount"
 
+    # OpenDART full statements use cumulative CF values for interim reports.
+    # Current CF is normally thstrm_amount; prior-year comparable cumulative
+    # CF is normally frmtrm_add_amount. Fall back only when a field is absent.
+    current_cash_key = "thstrm_amount"
+    prior_cash_key = "frmtrm_add_amount"
+    if rows:
+        cf_rows = [r for r in rows if r.get("sj_div") == "CF"]
+        if not any(_jnum(r.get(current_cash_key)) is not None for r in cf_rows):
+            current_cash_key = "thstrm_add_amount"
+        if not any(_jnum(r.get(prior_cash_key)) is not None for r in cf_rows):
+            prior_cash_key = "frmtrm_amount"
+
     current_ytd = (
         _dart_metrics_from_rows(
             rows,
             income_key=current_income_key,
-            cash_key="thstrm_amount",
+            cash_key=current_cash_key,
             balance_key="thstrm_amount",
         )
         if rows else {}
@@ -490,7 +517,7 @@ def _dart_interim_ttm(
         _dart_metrics_from_rows(
             rows,
             income_key=prior_income_key,
-            cash_key="frmtrm_amount",
+            cash_key=prior_cash_key,
             balance_key="frmtrm_amount",
         )
         if rows else {}
@@ -1413,11 +1440,14 @@ def _compute_lfs(series, tax_rate, price=None, shares=None, current=None, indust
             "current_cfo": current_row.get("cfo"),
             "current_capex": current_row.get("capex"),
             "current_fcf": current_row.get("fcf"),
+            "cash_flow_complete": (
+                current_row.get("cfo") is not None and current_row.get("capex") is not None
+            ),
         },
         "history": clean,
         "current_data": current_row,
         "methodology": {
-            "version": "pilot-0.3.3",
+            "version": "pilot-0.3.4",
             "main_score": "40% current + 60% normalized; quality-only rescaled when valuation data is unavailable",
             "industry_percentile_method": "sector-adjusted parametric benchmark; not yet a live peer cross-section",
             "note": "TTM이 가능하면 현재점수는 TTM을 사용하고, 정상화점수는 최근 연간 분포의 중앙값/지속성을 사용합니다. 업종 percentile은 무료 즉시조회 버전의 섹터 benchmark CDF입니다.",
