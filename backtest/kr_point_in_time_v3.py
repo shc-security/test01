@@ -5,17 +5,17 @@ from __future__ import annotations
 import argparse
 import json
 from argparse import Namespace
+from datetime import date, datetime, timedelta
 
 import pandas as pd
+import requests
 
 from backtest import kr_point_in_time as base
 from backtest import kr_point_in_time_v2 as strict
 from backtest.pit_dart import is_financial_company
 
-# Names are checked before any filing retrieval so an unavailable historical XBRL
-# package for a bank/insurer cannot be misclassified as an eligible-company data
-# failure. is_financial_company intentionally does not use current KSIC alone.
 EXPLICIT_FINANCIAL_NAMES = {"신한지주", "현대해상"}
+_PRICE_CACHE = {}
 
 
 def strict_snapshot_score(dart, corp, ticker, asof, cap_snapshot):
@@ -23,6 +23,95 @@ def strict_snapshot_score(dart, corp, ticker, asof, cap_snapshot):
     if name in EXPLICIT_FINANCIAL_NAMES or is_financial_company(None, name):
         raise ValueError("financial-sector company excluded: ROIC model is not comparable")
     return strict.strict_snapshot_score(dart, corp, ticker, asof, cap_snapshot)
+
+
+def _yahoo_symbol(ticker: str, market: str | None = None) -> str:
+    suffix = ".KQ" if str(market or "").upper() == "KOSDAQ" else ".KS"
+    return f"{str(ticker).zfill(6)}{suffix}"
+
+
+def _yahoo_adjusted_price(ticker: str, target: date, market: str | None = None, on_or_after: bool = True):
+    """Return Yahoo adjusted close near target.
+
+    Adjusted close is used specifically to put pre/post split quotes on one basis.
+    The selected trading date remains point-in-time; only the price scale is adjusted.
+    """
+    key = (str(ticker).zfill(6), str(market or ""), target.isoformat(), bool(on_or_after))
+    if key in _PRICE_CACHE:
+        return _PRICE_CACHE[key]
+    symbol = _yahoo_symbol(ticker, market)
+    lo = target - timedelta(days=12 if not on_or_after else 2)
+    hi = target + timedelta(days=22)
+    params = {
+        "period1": int(datetime.combine(lo, datetime.min.time()).timestamp()),
+        "period2": int(datetime.combine(hi, datetime.min.time()).timestamp()),
+        "interval": "1d",
+        "events": "history,div,splits",
+    }
+    try:
+        r = requests.get(
+            base.YAHOO_CHART.format(symbol=symbol),
+            params=params,
+            headers={"User-Agent": "Mozilla/5.0 lattice-stock-analyzer-backtest"},
+            timeout=(4, 15),
+        )
+        r.raise_for_status()
+        result = r.json()["chart"]["result"][0]
+        timestamps = result.get("timestamp") or []
+        adj = result.get("indicators", {}).get("adjclose", [{}])[0].get("adjclose") or []
+        raw = result.get("indicators", {}).get("quote", [{}])[0].get("close") or []
+        values = adj if any(x is not None for x in adj) else raw
+        pairs = []
+        for ts, px in zip(timestamps, values):
+            if px is None:
+                continue
+            d = datetime.utcfromtimestamp(ts).date()
+            pairs.append((d, float(px)))
+        pairs.sort()
+        if on_or_after:
+            eligible = [x for x in pairs if x[0] >= target]
+            out = (eligible[0][1], eligible[0][0]) if eligible else None
+        else:
+            eligible = [x for x in pairs if x[0] <= target]
+            out = (eligible[-1][1], eligible[-1][0]) if eligible else None
+    except Exception:
+        out = None
+    _PRICE_CACHE[key] = out
+    return out
+
+
+def strict_start_price(marcap, ticker: str, asof: date):
+    # Resolve the historical market from the PIT snapshot, then use adjusted close.
+    market = None
+    try:
+        _, snap = marcap.snapshot_on_or_after(asof)
+        hit = snap[snap["Code"] == str(ticker).zfill(6)]
+        if not hit.empty:
+            market = str(hit.iloc[0].get("Market") or "")
+    except Exception:
+        pass
+    found = _yahoo_adjusted_price(ticker, asof, market, True)
+    if found:
+        return found
+    return base.MarcapStore.first_price_on_or_after(marcap, str(ticker).zfill(6), asof, days=20)
+
+
+def strict_terminal_price(marcap, ticker: str, start: date, target: date):
+    market = None
+    try:
+        _, snap = marcap.snapshot_on_or_after(start)
+        hit = snap[snap["Code"] == str(ticker).zfill(6)]
+        if not hit.empty:
+            market = str(hit.iloc[0].get("Market") or "")
+    except Exception:
+        pass
+    found = _yahoo_adjusted_price(ticker, target, market, True)
+    if found:
+        px, dt = found
+        return px, dt, "yahoo_adjusted_target_or_next"
+    # Fail-safe for delisted/suspended names: retain them rather than silently
+    # dropping them. Such rows are explicitly labelled for downstream review.
+    return base.terminal_price(marcap, str(ticker).zfill(6), start, target)
 
 
 def validate_eligible_coverage(start_year: int, end_year: int, minimum: float) -> None:
@@ -52,7 +141,6 @@ def validate_eligible_coverage(start_year: int, end_year: int, minimum: float) -
 
 
 def validate_receipt_audit(start_year: int, end_year: int, minimum_spotchecks: int = 10) -> None:
-    """Fail closed if ranked rows cannot be traced to receipts public by the as-of date."""
     path = base.OUT_DIR / "ranked_cohorts.csv"
     if not path.exists():
         raise RuntimeError("ranked_cohorts.csv missing")
@@ -107,11 +195,9 @@ def main():
     p.add_argument("--min-score-coverage", type=float, default=0.80)
     args = p.parse_args()
 
-    # FinanceData/marcap is already split-adjusted historically. Applying an
-    # inferred split factor a second time corrupts long-horizon returns (e.g.
-    # SK hynix). Keep raw Marcap closes and fail closed on extreme returns so
-    # genuine demergers/delistings are still reviewed explicitly.
     base.snapshot_score = strict_snapshot_score
+    base.start_price = strict_start_price
+    base.terminal_price = strict_terminal_price
     run_args = Namespace(**vars(args))
     run_args.min_score_coverage = 0.0
     base.run(run_args)
