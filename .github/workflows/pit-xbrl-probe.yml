@@ -1,0 +1,29 @@
+name: PIT XBRL integrity probe
+
+on:
+  push:
+    paths:
+      - 'backtest/pit_dart.py'
+      - 'backtest/probe_pit_xbrl.py'
+      - '.github/workflows/pit-xbrl-probe.yml'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DART_API_KEY: ${{ secrets.DART_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Receipt-specific XBRL spot checks
+        run: python -m backtest.probe_pit_xbrl
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pit-xbrl-probe
+          path: backtest/out/pit_xbrl_probe.json
+          retention-days: 30
