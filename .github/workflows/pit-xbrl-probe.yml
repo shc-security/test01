@@ -19,6 +19,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: Install probe dependencies
+        run: pip install -r backtest/requirements.txt
       - name: Receipt-specific XBRL spot checks
         run: python -m backtest.probe_pit_xbrl
       - uses: actions/upload-artifact@v4
