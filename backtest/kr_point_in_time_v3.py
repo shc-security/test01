@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Strict PIT runner with eligible-universe coverage and split-adjusted returns."""
+"""Strict PIT runner with eligible-universe coverage and corporate-action-aware returns."""
 
 import argparse
 import json
@@ -14,6 +14,15 @@ from backtest import kr_point_in_time as base
 from backtest import kr_point_in_time_v2 as strict
 
 EXPLICIT_FINANCIAL_NAMES = {"신한지주", "현대해상"}
+
+# BGF Retail (old 027410) was split on 2017-11-01 into surviving BGF
+# (027410) and newly listed BGF Retail (282330).  One old share economically
+# became 0.6511658 BGF share + 0.3488342 BGF Retail share.  A plain 027410
+# price series therefore creates a false ~97% loss after the demerger.
+BGF_DEMERGER_DATE = date(2017, 11, 1)
+BGF_SURVIVING_RATIO = 0.6511658
+BGF_SPINOFF_RATIO = 0.3488342
+BGF_SPINOFF_TICKER = "282330"
 
 
 def strict_snapshot_score(dart, corp, ticker, asof, cap_snapshot):
@@ -82,6 +91,7 @@ def _adjust_to_common_basis(store, ticker: str, px: float, dt):
 
 _ORIG_FIRST = base.MarcapStore.first_price_on_or_after
 _ORIG_LAST = base.MarcapStore.last_price_on_or_before
+_ORIG_TERMINAL = base.terminal_price
 
 
 def _adjusted_first(self, ticker, target, days=20):
@@ -98,6 +108,24 @@ def _adjusted_last(self, ticker, start, target):
         return None
     px, dt = found
     return _adjust_to_common_basis(self, ticker, px, dt), dt
+
+
+def _strict_terminal_price(marcap, ticker: str, start: date, target: date):
+    """Return a comparable terminal value, including known demerger entitlements.
+
+    For BGF, holders before the 2017 equity demerger received both the surviving
+    BGF shares and newly listed BGF Retail shares.  We value both legs at the
+    horizon instead of pretending that the post-demerger 027410 quote alone is
+    the continuation of the pre-demerger company.
+    """
+    if ticker == "027410" and start < BGF_DEMERGER_DATE <= target:
+        bgf = _ORIG_TERMINAL(marcap, ticker, BGF_DEMERGER_DATE, target)
+        retail = _ORIG_TERMINAL(marcap, BGF_SPINOFF_TICKER, BGF_DEMERGER_DATE, target)
+        bgf_px, bgf_dt, _ = bgf
+        retail_px, retail_dt, _ = retail
+        synthetic = BGF_SURVIVING_RATIO * bgf_px + BGF_SPINOFF_RATIO * retail_px
+        return synthetic, max(bgf_dt, retail_dt), "demerger_total_value:027410+282330"
+    return _ORIG_TERMINAL(marcap, ticker, start, target)
 
 
 def validate_eligible_coverage(start_year: int, end_year: int, minimum: float) -> None:
@@ -133,9 +161,8 @@ def validate_return_sanity():
     df = pd.read_csv(path)
     if df.empty:
         raise RuntimeError("no forward returns")
-    # Raw split artifacts previously produced impossible-looking 50:1 discontinuities
-    # (e.g. Samsung Electronics). Flag extreme losses that are typical of an
-    # unadjusted split; they require inspection rather than silent publication.
+    # Flag extreme losses that are typical of an unhandled split/demerger.
+    # Such rows must be explicitly modeled rather than silently published.
     suspicious = df[(df["price_return"] <= -0.95) & (df["horizon_years"] >= 3)]
     if not suspicious.empty:
         cols = ["cohort_year", "ticker", "name", "horizon_years", "price_return"]
@@ -156,6 +183,7 @@ def main():
     base.snapshot_score = strict_snapshot_score
     base.MarcapStore.first_price_on_or_after = _adjusted_first
     base.MarcapStore.last_price_on_or_before = _adjusted_last
+    base.terminal_price = _strict_terminal_price
     run_args = Namespace(**vars(args))
     run_args.min_score_coverage = 0.0
     base.run(run_args)
