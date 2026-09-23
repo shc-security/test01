@@ -1,3 +1,4 @@
+# strict receipt-specific historical filing validation
 name: LFS strict receipt PIT backtest
 
 concurrency:
