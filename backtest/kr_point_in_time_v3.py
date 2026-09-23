@@ -12,7 +12,11 @@ import pandas as pd
 
 from backtest import kr_point_in_time as base
 from backtest import kr_point_in_time_v2 as strict
+from backtest.pit_dart import is_financial_company
 
+# Names are checked before any filing retrieval so an unavailable historical XBRL
+# package for a bank/insurer cannot be misclassified as an eligible-company data
+# failure. is_financial_company intentionally does not use current KSIC alone.
 EXPLICIT_FINANCIAL_NAMES = {"신한지주", "현대해상"}
 
 # BGF Retail (old 027410) was split on 2017-11-01 into surviving BGF
@@ -27,7 +31,7 @@ BGF_SPINOFF_TICKER = "282330"
 
 def strict_snapshot_score(dart, corp, ticker, asof, cap_snapshot):
     name = str(corp.get("corp_name") or "").replace(" ", "")
-    if name in EXPLICIT_FINANCIAL_NAMES:
+    if name in EXPLICIT_FINANCIAL_NAMES or is_financial_company(None, name):
         raise ValueError("financial-sector company excluded: ROIC model is not comparable")
     return strict.strict_snapshot_score(dart, corp, ticker, asof, cap_snapshot)
 
@@ -154,6 +158,39 @@ def validate_eligible_coverage(start_year: int, end_year: int, minimum: float) -
         raise RuntimeError("; ".join(failures))
 
 
+def validate_receipt_audit(start_year: int, end_year: int, minimum_spotchecks: int = 10) -> None:
+    """Fail closed if ranked rows cannot be traced to receipts public by the as-of date."""
+    path = base.OUT_DIR / "ranked_cohorts.csv"
+    if not path.exists():
+        raise RuntimeError("ranked_cohorts.csv missing")
+    df = pd.read_csv(path)
+    if df.empty:
+        raise RuntimeError("no ranked cohorts")
+    # ranked_cohorts contains filing_dates_used serialized by the base runner.
+    checked = 0
+    violations = []
+    for _, row in df.iterrows():
+        asof = str(row.get("asof_date") or "")[:10].replace("-", "")
+        raw = row.get("filing_dates_used")
+        if pd.isna(raw):
+            continue
+        try:
+            dates = json.loads(raw) if isinstance(raw, str) else list(raw)
+        except Exception:
+            dates = [x.strip().strip("[]'\"") for x in str(raw).split(",") if x.strip()]
+        dates = [str(x).replace("-", "") for x in dates if str(x).strip()]
+        if dates:
+            checked += 1
+            late = [d for d in dates if len(d) >= 8 and d[:8] > asof]
+            if late:
+                violations.append((row.get("cohort_year"), row.get("ticker"), late, asof))
+    if violations:
+        raise RuntimeError("look-ahead filing dates remain: " + repr(violations[:10]))
+    if checked < minimum_spotchecks:
+        raise RuntimeError(f"receipt audit rows {checked} < required {minimum_spotchecks}")
+    print(f"receipt audit: {checked} ranked rows traced to filing dates on/before cohort as-of dates", flush=True)
+
+
 def validate_return_sanity():
     path = base.OUT_DIR / "forward_returns.csv"
     if not path.exists():
@@ -188,6 +225,7 @@ def main():
     run_args.min_score_coverage = 0.0
     base.run(run_args)
     validate_eligible_coverage(args.start_year, args.end_year, args.min_score_coverage)
+    validate_receipt_audit(args.start_year, args.end_year, minimum_spotchecks=10)
     validate_return_sanity()
 
 
