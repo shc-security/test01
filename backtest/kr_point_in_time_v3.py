@@ -168,13 +168,20 @@ def validate_receipt_audit(start_year: int, end_year: int, minimum_spotchecks: i
     print(f"receipt audit: {checked} ranked rows traced to filing dates on/before cohort as-of dates", flush=True)
 
 
+def _add_years(d: date, years: int) -> date:
+    try:
+        return d.replace(year=d.year + years)
+    except ValueError:
+        return d.replace(month=2, day=28, year=d.year + years)
+
+
 def validate_return_sanity():
     """Reject impossible returns and independently verify extreme terminal quotes.
 
-    A large return is not itself a corporate-action error.  For example SK hynix
-    genuinely rose from roughly 25k KRW in 2016 to above 2m KRW in June 2026.
-    Extreme Yahoo-adjusted returns are accepted only when the terminal quote is
-    independently consistent with the raw KRX/marcap terminal quote.
+    The forward-return CSV intentionally stores only the cohort as-of date, not a
+    redundant target-date column. Reconstruct the contractual horizon from that
+    date and independently compare the terminal quote with KRX/marcap. This check
+    is deliberately independent of the Yahoo adjusted series used for the return.
     """
     path = base.OUT_DIR / "forward_returns.csv"
     if not path.exists():
@@ -195,11 +202,11 @@ def validate_return_sanity():
     for _, row in extreme.iterrows():
         try:
             ticker = str(int(row["ticker"])).zfill(6) if str(row["ticker"]).replace(".0", "").isdigit() else str(row["ticker"]).zfill(6)
-            target = datetime.strptime(str(row["target_date"])[:10], "%Y-%m-%d").date()
-            start = datetime.strptime(str(row["entry_date"])[:10], "%Y-%m-%d").date()
-            raw = marcap.last_price_on_or_before(ticker, start, target + timedelta(days=20))
+            asof = datetime.strptime(str(row["asof_date"])[:10], "%Y-%m-%d").date()
+            target = _add_years(asof, int(row["horizon_years"]))
+            raw = marcap.first_price_on_or_after(ticker, target, days=20)
             if not raw:
-                failures.append((ticker, "independent terminal price missing"))
+                failures.append((ticker, "independent terminal price missing", target.isoformat()))
                 continue
             raw_px, raw_dt = raw
             yahoo_px = float(row["end_price"])
