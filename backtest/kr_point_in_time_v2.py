@@ -2,9 +2,9 @@ from __future__ import annotations
 
 """Strict point-in-time wrapper around kr_point_in_time.
 
-Historical LFS inputs come only from the exact OpenDART annual-report receipt
-that was public by the ranking date. Later restatements from today's financial
-API are never used as historical facts.
+Historical LFS inputs come only from exact OpenDART annual-report receipts that
+were public by the ranking date. Later restatements from today's financial API
+are never used as historical facts.
 """
 
 import argparse
@@ -15,35 +15,19 @@ from api import analyze as lfs
 from backtest import kr_point_in_time as base
 from backtest.pit_dart import HistoricalDart, is_financial_company
 
-
 FLOW_TAGS = {
-    "revenue": (
-        "RevenueFromContractsWithCustomers", "Revenue", "Sales", "SalesRevenue",
-        "OperatingRevenue", "RevenueFromRenderingOfServices", "Revenues",
-    ),
-    "operating_income": (
-        "OperatingIncomeLoss", "OperatingProfitLoss", "OperatingIncome", "OperatingProfit",
-    ),
-    "net_income": (
-        "ProfitLoss", "ProfitLossAttributableToOwnersOfParent", "NetIncomeLoss", "NetIncome",
-    ),
-    "cfo": (
-        "CashFlowsFromUsedInOperatingActivities", "NetCashFlowsFromUsedInOperatingActivities",
-    ),
-    "capex": (
-        "PurchaseOfPropertyPlantAndEquipment", "PaymentsToAcquirePropertyPlantAndEquipment",
-        "AcquisitionOfPropertyPlantAndEquipment", "PurchaseOfPropertyPlantAndEquipmentAndIntangibleAssets",
-    ),
+    "revenue": ("RevenueFromContractsWithCustomers", "Revenue", "Sales", "SalesRevenue", "OperatingRevenue", "RevenueFromRenderingOfServices", "Revenues"),
+    "operating_income": ("OperatingIncomeLoss", "OperatingProfitLoss", "OperatingIncome", "OperatingProfit"),
+    "net_income": ("ProfitLoss", "ProfitLossAttributableToOwnersOfParent", "NetIncomeLoss", "NetIncome"),
+    "cfo": ("CashFlowsFromUsedInOperatingActivities", "NetCashFlowsFromUsedInOperatingActivities"),
+    "capex": ("PurchaseOfPropertyPlantAndEquipment", "PaymentsToAcquirePropertyPlantAndEquipment", "AcquisitionOfPropertyPlantAndEquipment", "PurchaseOfPropertyPlantAndEquipmentAndIntangibleAssets"),
 }
 BALANCE_TAGS = {
     "assets": ("Assets", "TotalAssets"),
     "equity": ("Equity", "EquityAttributableToOwnersOfParent", "TotalEquity"),
     "cash": ("CashAndCashEquivalents", "CashAndCashEquivalentsAtEndOfPeriodCf"),
 }
-DEBT_TAGS = (
-    "ShorttermBorrowings", "BorrowingsCurrent", "CurrentPortionOfLongtermBorrowings",
-    "LongtermBorrowings", "CurrentPortionOfBonds", "BondsIssued",
-)
+DEBT_TAGS = ("ShorttermBorrowings", "BorrowingsCurrent", "CurrentPortionOfLongtermBorrowings", "LongtermBorrowings", "CurrentPortionOfBonds", "BondsIssued")
 
 
 def _iso(s):
@@ -66,9 +50,6 @@ def _tag_matches(tag, aliases):
     if tag in aliases:
         return True
     low = str(tag or "").lower()
-    # Conservative extension-tag fallback. Custom Korean XBRL concepts often
-    # prefix/suffix a standard concept name; do not use broad words such as
-    # merely 'income' or 'sales' here because they can match subtotals.
     strong = [a.lower() for a in aliases if len(a) >= 12]
     return any(a in low or low in a for a in strong)
 
@@ -79,9 +60,7 @@ def _flow_value(rows, tags, year):
         if not _tag_matches(f.get("tag"), tags):
             continue
         st, en = _iso(f.get("start")), _iso(f.get("end"))
-        if not st or not en or en.year != year:
-            continue
-        if 330 <= (en - st).days <= 380:
+        if st and en and en.year == year and 330 <= (en - st).days <= 380:
             candidates.append(float(f["value"]))
     if not candidates:
         return None
@@ -129,10 +108,30 @@ def _metrics_from_receipt(facts, year):
     return best
 
 
+def _latest_parseable_receipt(pit, corp_code, fy, asof):
+    """Newest receipt available by asof whose own XBRL can be parsed.
+
+    An amendment without an XBRL package must not make a company disappear from
+    the historical universe. Falling back to an older receipt is safe because
+    that older receipt was already public at the same as-of date.
+    """
+    failures = []
+    for rec in pit.annual_receipts(corp_code, fy, asof):
+        rdt = str(rec.get("rcept_dt") or rec.get("rcept_no", "")[:8])
+        if len(rdt) != 8 or not rdt.isdigit() or rdt > asof.strftime("%Y%m%d"):
+            raise ValueError(f"look-ahead receipt detected FY{fy}: {rdt} > {asof:%Y%m%d}")
+        try:
+            facts = pit.xbrl_facts(rec["rcept_no"])
+            metric = _metrics_from_receipt(facts, fy)
+            return rec, metric
+        except (RuntimeError, ValueError) as exc:
+            failures.append(f"{rec.get('rcept_no')}: {exc}")
+    return None, None
+
+
 def strict_snapshot_score(dart_unused, corp, ticker, asof, cap_snapshot):
     pit = HistoricalDart(cache_dir=base.CACHE_DIR / "pit_dart")
     latest_year = asof.year - 1
-
     info = {}
     try:
         info = dart_unused.company(corp["corp_code"])
@@ -141,20 +140,12 @@ def strict_snapshot_score(dart_unused, corp, ticker, asof, cap_snapshot):
     if is_financial_company(info.get("induty_code"), corp.get("corp_name")):
         raise ValueError("financial-sector company excluded: ROIC model is not comparable")
 
-    rows = []
-    receipts = []
+    rows, receipts = [], []
     for fy in range(latest_year, max(2011, latest_year - 6), -1):
-        rec = pit.annual_receipt(corp["corp_code"], fy, asof)
-        if not rec:
+        rec, metric = _latest_parseable_receipt(pit, corp["corp_code"], fy, asof)
+        if not rec or not metric:
             continue
         rdt = str(rec.get("rcept_dt") or rec.get("rcept_no", "")[:8])
-        if len(rdt) != 8 or rdt > asof.strftime("%Y%m%d"):
-            raise ValueError(f"look-ahead receipt detected FY{fy}: {rdt} > {asof:%Y%m%d}")
-        try:
-            facts = pit.xbrl_facts(rec["rcept_no"])
-            metric = _metrics_from_receipt(facts, fy)
-        except (RuntimeError, ValueError):
-            continue
         metric["_receipt_no"] = rec["rcept_no"]
         metric["_receipt_date"] = rdt
         rows.append(metric)
@@ -173,40 +164,23 @@ def strict_snapshot_score(dart_unused, corp, ticker, asof, cap_snapshot):
     cap_row = cap_snapshot.get(ticker)
     if not cap_row:
         raise ValueError("historical KRX market cap missing")
-
     sector = lfs._sector_from_kr_industry(info.get("induty_code"))
     if sector == "Financials":
         sector = "General"
-
     equity_cap = cap_row["market_cap"]
     ev = None
     if latest.get("debt") is not None and latest.get("cash") is not None:
         ev = equity_cap + latest["debt"] - latest["cash"]
 
-    result = lfs._compute_lfs(
-        rows,
-        tax_rate=0.24,
-        current=None,
-        industry={"sector": sector},
-        equity_market_cap=equity_cap,
-        enterprise_value=ev,
-    )
+    result = lfs._compute_lfs(rows, tax_rate=0.24, current=None, industry={"sector": sector}, equity_market_cap=equity_cap, enterprise_value=ev)
     return {
-        "ticker": ticker,
-        "name": corp["corp_name"],
-        "corp_code": corp["corp_code"],
-        "market": cap_row["market"],
-        "score": result["score"],
-        "current_score": result["current_score"],
-        "long_score": result["normalized_score"],
-        "valuation_available": result["valuation_available"],
-        "history_periods": len(rows),
-        "filing_dates_used": [r["rcept_dt"] for r in receipts],
-        "receipts_used": receipts,
-        "preferred_coverage_complete": False,
-        "preferred_tickers_used": [],
-        "market_cap": equity_cap,
-        "enterprise_value": ev,
+        "ticker": ticker, "name": corp["corp_name"], "corp_code": corp["corp_code"],
+        "market": cap_row["market"], "score": result["score"],
+        "current_score": result["current_score"], "long_score": result["normalized_score"],
+        "valuation_available": result["valuation_available"], "history_periods": len(rows),
+        "filing_dates_used": [r["rcept_dt"] for r in receipts], "receipts_used": receipts,
+        "preferred_coverage_complete": False, "preferred_tickers_used": [],
+        "market_cap": equity_cap, "enterprise_value": ev,
         "point_in_time_source": "receipt-specific OpenDART XBRL",
     }
 
