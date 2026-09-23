@@ -69,11 +69,15 @@ def _split_events(store, ticker: str):
 
 
 def _adjust_to_common_basis(store, ticker: str, px: float, dt):
+    # Convert a historical pre-split quote onto today's/post-event share basis.
+    # Example: a 50:1 split turns a pre-split 2,500,000 KRW quote into
+    # 50,000 KRW on the post-split basis, so the historical quote is divided
+    # by the cumulative future split ratio (not multiplied).
     factor = 1.0
     for event_date, ratio in _split_events(store, ticker):
         if event_date > dt:
             factor *= ratio
-    return float(px) * factor
+    return float(px) / factor if factor else float(px)
 
 
 _ORIG_FIRST = base.MarcapStore.first_price_on_or_after
