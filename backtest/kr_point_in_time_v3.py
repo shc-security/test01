@@ -20,8 +20,8 @@ from backtest.pit_dart import is_financial_company
 EXPLICIT_FINANCIAL_NAMES = {"신한지주", "현대해상"}
 
 # BGF Retail (old 027410) was split on 2017-11-01 into surviving BGF
-# (027410) and newly listed BGF Retail (282330).  One old share economically
-# became 0.6511658 BGF share + 0.3488342 BGF Retail share.  A plain 027410
+# (027410) and newly listed BGF Retail (282330). One old share economically
+# became 0.6511658 BGF share + 0.3488342 BGF Retail share. A plain 027410
 # price series therefore creates a false ~97% loss after the demerger.
 BGF_DEMERGER_DATE = date(2017, 11, 1)
 BGF_SURVIVING_RATIO = 0.6511658
@@ -37,12 +37,7 @@ def strict_snapshot_score(dart, corp, ticker, asof, cap_snapshot):
 
 
 def _split_events(store, ticker: str):
-    """Infer mechanical stock splits/reverse-splits from Marcap shares and price.
-
-    A genuine split changes listed shares sharply while the raw close moves in the
-    reciprocal direction. Rights offerings / ordinary issuance are deliberately
-    not adjusted unless the price/share discontinuity is mechanically reciprocal.
-    """
+    """Infer mechanical stock splits/reverse-splits from Marcap shares and price."""
     cache = getattr(store, "_strict_split_events", None)
     if cache is None:
         cache = {}
@@ -73,7 +68,7 @@ def _split_events(store, ticker: str):
             sr = shares / prev[2]
             pr = close / prev[1]
             # >=20% share-count discontinuity, with market-cap continuity within 35%.
-            # This catches 50:1 / 5:1 / 2:1 splits while avoiding ordinary issuance.
+            # This catches mechanical splits while avoiding ordinary issuance.
             if (sr >= 1.20 or sr <= (1 / 1.20)) and abs(math.log(pr * sr)) <= math.log(1.35):
                 events.append((row["Date"], sr))
         prev = (row["Date"], close, shares)
@@ -82,10 +77,11 @@ def _split_events(store, ticker: str):
 
 
 def _adjust_to_common_basis(store, ticker: str, px: float, dt):
-    # Convert a historical pre-split quote onto today's/post-event share basis.
-    # Example: a 50:1 split turns a pre-split 2,500,000 KRW quote into
-    # 50,000 KRW on the post-split basis, so the historical quote is divided
-    # by the cumulative future split ratio (not multiplied).
+    """Put every quote on one post-event share basis.
+
+    Both entry and terminal quotes MUST pass through this function. If only the
+    entry is adjusted, a split after the horizon can manufacture enormous gains.
+    """
     factor = 1.0
     for event_date, ratio in _split_events(store, ticker):
         if event_date > dt:
@@ -115,21 +111,19 @@ def _adjusted_last(self, ticker, start, target):
 
 
 def _strict_terminal_price(marcap, ticker: str, start: date, target: date):
-    """Return a comparable terminal value, including known demerger entitlements.
-
-    For BGF, holders before the 2017 equity demerger received both the surviving
-    BGF shares and newly listed BGF Retail shares.  We value both legs at the
-    horizon instead of pretending that the post-demerger 027410 quote alone is
-    the continuation of the pre-demerger company.
-    """
+    """Return a terminal value on the same split basis as the entry quote."""
     if ticker == "027410" and start < BGF_DEMERGER_DATE <= target:
         bgf = _ORIG_TERMINAL(marcap, ticker, BGF_DEMERGER_DATE, target)
         retail = _ORIG_TERMINAL(marcap, BGF_SPINOFF_TICKER, BGF_DEMERGER_DATE, target)
         bgf_px, bgf_dt, _ = bgf
         retail_px, retail_dt, _ = retail
+        bgf_px = _adjust_to_common_basis(marcap, ticker, bgf_px, bgf_dt)
+        retail_px = _adjust_to_common_basis(marcap, BGF_SPINOFF_TICKER, retail_px, retail_dt)
         synthetic = BGF_SURVIVING_RATIO * bgf_px + BGF_SPINOFF_RATIO * retail_px
         return synthetic, max(bgf_dt, retail_dt), "demerger_total_value:027410+282330"
-    return _ORIG_TERMINAL(marcap, ticker, start, target)
+
+    px, dt, source = _ORIG_TERMINAL(marcap, ticker, start, target)
+    return _adjust_to_common_basis(marcap, ticker, px, dt), dt, source
 
 
 def validate_eligible_coverage(start_year: int, end_year: int, minimum: float) -> None:
@@ -166,7 +160,6 @@ def validate_receipt_audit(start_year: int, end_year: int, minimum_spotchecks: i
     df = pd.read_csv(path)
     if df.empty:
         raise RuntimeError("no ranked cohorts")
-    # ranked_cohorts contains filing_dates_used serialized by the base runner.
     checked = 0
     violations = []
     for _, row in df.iterrows():
@@ -198,11 +191,12 @@ def validate_return_sanity():
     df = pd.read_csv(path)
     if df.empty:
         raise RuntimeError("no forward returns")
-    # Flag extreme losses that are typical of an unhandled split/demerger.
-    # Such rows must be explicitly modeled rather than silently published.
-    suspicious = df[(df["price_return"] <= -0.95) & (df["horizon_years"] >= 3)]
+    # Extreme losses commonly signal an unhandled demerger/delisting. Very large
+    # gains are also fail-closed because a basis mismatch can create 10x-100x
+    # phantom returns. They require manual review before publication.
+    suspicious = df[((df["price_return"] <= -0.95) | (df["price_return"] >= 20.0)) & (df["horizon_years"] >= 3)]
     if not suspicious.empty:
-        cols = ["cohort_year", "ticker", "name", "horizon_years", "price_return"]
+        cols = ["cohort_year", "ticker", "name", "horizon_years", "start_price", "end_price", "price_return", "terminal_source"]
         raise RuntimeError("suspicious corporate-action returns remain: " + suspicious[cols].head(10).to_json(orient="records", force_ascii=False))
 
 
