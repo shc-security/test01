@@ -1,0 +1,45 @@
+name: LFS strict receipt PIT backtest
+
+concurrency:
+  group: lfs-strict-pit-master
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - 'backtest/kr_point_in_time_v2.py'
+      - 'backtest/pit_dart.py'
+      - '.github/workflows/lfs-strict-pit.yml'
+
+jobs:
+  full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      DART_API_KEY: ${{ secrets.DART_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r backtest/requirements.txt
+      - name: Strict syntax check
+        run: python -m py_compile backtest/pit_dart.py backtest/kr_point_in_time_v2.py
+      - name: Require DART key
+        run: test -n "$DART_API_KEY"
+      - uses: actions/cache@v4
+        with:
+          path: backtest/.cache
+          key: lfs-strict-pit-v2-2016-2025
+          restore-keys: |
+            lfs-strict-pit-v2-
+      - name: Run strict 2016-2025 point-in-time backtest
+        run: python backtest/kr_point_in_time_v2.py --start-year 2016 --end-year 2025 --universe-size 100 --top-n 10 --workers 4 --min-mapping-coverage 0.95 --min-score-coverage 0.80
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lfs-strict-pit-results
+          path: backtest/out/
+          retention-days: 90
