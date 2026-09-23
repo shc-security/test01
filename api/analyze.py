@@ -18,11 +18,77 @@ SEC_BASE = "https://data.sec.gov"
 SEC_TICKERS = "https://www.sec.gov/files/company_tickers.json"
 SEC_TICKERS_LOCAL = Path(__file__).resolve().parent.parent / "data" / "sec_tickers.json"
 YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{}"
+YAHOO_SEARCH = "https://query2.finance.yahoo.com/v1/finance/search"
 DART_CORP_CACHE_URL = "https://raw.githubusercontent.com/jinhoo-choi/risk-news-crolling/main/dart_corp_codes.json"
 SEC_TICKERS_MIRROR = "https://raw.githubusercontent.com/lwowlwowl/company_name_to_ticker/main/company_tickers.json"
 
 _DART_CORPS = None
 _SEC_TICKER_MAP = None
+
+# Korean aliases make U.S. ticker lookup usable without knowing English names.
+# Yahoo's Korean-locale search is also queried at runtime, so this dictionary is
+# a deterministic fallback for popular names rather than the only translation source.
+US_KO_ALIASES = {
+    "애플": "AAPL",
+    "마이크로소프트": "MSFT", "마소": "MSFT",
+    "엔비디아": "NVDA",
+    "아마존": "AMZN",
+    "테슬라": "TSLA",
+    "구글": "GOOGL", "알파벳": "GOOGL",
+    "메타": "META", "페이스북": "META",
+    "넷플릭스": "NFLX",
+    "브로드컴": "AVGO",
+    "팔란티어": "PLTR",
+    "에이엠디": "AMD", "AMD": "AMD",
+    "인텔": "INTC",
+    "퀄컴": "QCOM",
+    "마이크론": "MU",
+    "오라클": "ORCL",
+    "세일즈포스": "CRM",
+    "어도비": "ADBE",
+    "시스코": "CSCO",
+    "아이비엠": "IBM", "IBM": "IBM",
+    "코스트코": "COST",
+    "월마트": "WMT",
+    "홈디포": "HD",
+    "맥도날드": "MCD",
+    "스타벅스": "SBUX",
+    "나이키": "NKE",
+    "코카콜라": "KO",
+    "펩시": "PEP",
+    "비자": "V",
+    "마스터카드": "MA",
+    "제이피모건": "JPM", "JP모건": "JPM",
+    "뱅크오브아메리카": "BAC",
+    "골드만삭스": "GS",
+    "버크셔해서웨이": "BRK.B", "버크셔": "BRK.B",
+    "엑슨모빌": "XOM",
+    "셰브론": "CVX",
+    "보잉": "BA",
+    "록히드마틴": "LMT",
+    "캐터필러": "CAT",
+    "디즈니": "DIS",
+    "컴캐스트": "CMCSA",
+    "버라이즌": "VZ",
+    "에이티앤티": "T", "AT&T": "T",
+    "우버": "UBER",
+    "에어비앤비": "ABNB",
+    "로블록스": "RBLX",
+    "스포티파이": "SPOT",
+    "쇼피파이": "SHOP",
+    "코인베이스": "COIN",
+    "TSMC": "TSM", "대만반도체": "TSM",
+    "ASML": "ASML",
+    "일라이릴리": "LLY",
+    "노보노디스크": "NVO",
+    "화이자": "PFE",
+    "존슨앤존슨": "JNJ",
+    "유나이티드헬스": "UNH",
+    "알리바바": "BABA",
+    "핀둬둬": "PDD",
+    "니오": "NIO",
+}
+
 
 
 def _jnum(v):
@@ -1171,15 +1237,264 @@ def _load_sec_tickers():
     return emergency
 
 
-def _sec_company(q):
-    q = q.strip().upper()
+
+def _search_norm(value):
+    return "".join(str(value or "").strip().lower().split())
+
+
+def _yahoo_search_quotes(q, count=12):
+    if not str(q or "").strip():
+        return []
+    try:
+        data = _http_get(
+            YAHOO_SEARCH,
+            params={
+                "q": str(q).strip(),
+                "quotesCount": str(count),
+                "newsCount": "0",
+                "enableFuzzyQuery": "true",
+                "region": "KR",
+                "lang": "ko-KR",
+            },
+            headers={"User-Agent": "Mozilla/5.0 (compatible; lattice-stock-analyzer/1.0)"},
+            timeout=(1.5, 3.5),
+        ).json()
+        return data.get("quotes") or []
+    except Exception:
+        return []
+
+
+def _kr_parent_query_for_security(ticker, name, corps):
+    by_stock = {x.get("stock_code"): x for x in corps if x.get("stock_code")}
+    if ticker in by_stock:
+        return ticker
+
+    # Korean preferred-share security codes commonly share the first five
+    # digits with the ordinary share and use a non-zero class digit.
+    if len(ticker) == 6 and ticker.isdigit():
+        ordinary_guess = ticker[:5] + "0"
+        if ordinary_guess in by_stock:
+            return ordinary_guess
+
+    n = _search_norm(name)
+    suffixes = ("우선주", "우b", "우c", "1우", "2우", "3우", "우")
+    for suffix in suffixes:
+        if n.endswith(suffix):
+            n = n[: -len(suffix)]
+            break
+    exact = [x for x in corps if x.get("stock_code") and _search_norm(x.get("corp_name")) == n]
+    if exact:
+        return exact[0]["stock_code"]
+    return None
+
+
+def _search_kr(q, limit=10):
+    needle = _search_norm(q)
+    if not needle:
+        return []
+    corps = [x for x in _load_dart_corps() if x.get("stock_code")]
+    ranked = []
+    for corp in corps:
+        name_n = _search_norm(corp.get("corp_name"))
+        ticker = str(corp.get("stock_code") or "")
+        if needle == _search_norm(ticker):
+            rank = 0
+        elif name_n == needle:
+            rank = 1
+        elif name_n.startswith(needle):
+            rank = 2
+        elif needle in name_n:
+            rank = 3
+        elif ticker.startswith(str(q).strip()):
+            rank = 4
+        else:
+            continue
+        ranked.append((rank, len(name_n), corp.get("corp_name") or "", {
+            "market": "KR",
+            "ticker": ticker,
+            "name": corp.get("corp_name") or ticker,
+            "query": ticker,
+            "kind": "보통주/상장사",
+        }))
+    ranked.sort(key=lambda x: (x[0], x[1], x[2]))
+
+    # Keep several deterministic DART matches and merge Yahoo security-level
+    # matches so preferred shares such as 삼성전자우 can also appear.
+    out = [x[3] for x in ranked[: max(5, limit // 2)]]
+    seen = {(x["ticker"], x["query"]) for x in out}
+    for quote in _yahoo_search_quotes(q, count=max(12, limit * 2)):
+        if str(quote.get("quoteType") or "").upper() != "EQUITY":
+            continue
+        symbol = str(quote.get("symbol") or "").upper().strip()
+        if not (symbol.endswith(".KS") or symbol.endswith(".KQ")):
+            continue
+        ticker = symbol.split(".", 1)[0]
+        name = str(quote.get("longname") or quote.get("shortname") or ticker).strip()
+        parent_query = _kr_parent_query_for_security(ticker, name, corps)
+        if not parent_query:
+            continue
+        key = (ticker, parent_query)
+        if key in seen:
+            continue
+        seen.add(key)
+        kind = "우선주/별도주식종류" if ticker != parent_query else "보통주/상장사"
+        out.append({
+            "market": "KR",
+            "ticker": ticker,
+            "name": name,
+            "query": parent_query,
+            "kind": kind,
+        })
+        if len(out) >= limit:
+            break
+
+    if len(out) < limit:
+        for _, _, _, item in ranked:
+            key = (item["ticker"], item["query"])
+            if key in seen:
+                continue
+            out.append(item)
+            seen.add(key)
+            if len(out) >= limit:
+                break
+    return out[:limit]
+
+
+def _matching_us_aliases(q):
+    needle = _search_norm(q)
+    if not needle:
+        return []
+    matches = []
+    for alias, ticker in US_KO_ALIASES.items():
+        alias_n = _search_norm(alias)
+        if alias_n == needle:
+            rank = 0
+        elif alias_n.startswith(needle):
+            rank = 1
+        elif needle in alias_n:
+            rank = 2
+        else:
+            continue
+        matches.append((rank, len(alias_n), alias, ticker))
+    matches.sort(key=lambda x: (x[0], x[1], x[2]))
+    return matches
+
+
+def _search_us(q, limit=10):
+    needle = _search_norm(q)
+    if not needle:
+        return []
     mp = _load_sec_tickers()
-    if q in mp:
-        return mp[q]
-    matches = [v for v in mp.values() if q in v["title"].upper()]
+    out = []
+    seen = set()
+
+    # Korean aliases first so typing 엔비 immediately resolves to NVDA.
+    for _, _, alias, ticker in _matching_us_aliases(q):
+        item = mp.get(ticker)
+        if not item or ticker in seen:
+            continue
+        seen.add(ticker)
+        out.append({
+            "market": "US",
+            "ticker": ticker,
+            "name": f"{alias} · {item.get('title') or ticker}",
+            "query": ticker,
+            "kind": "미국주식",
+        })
+        if len(out) >= limit:
+            return out
+
+    local = []
+    q_upper = str(q).strip().upper()
+    for ticker, item in mp.items():
+        title = str(item.get("title") or "")
+        title_n = _search_norm(title)
+        if ticker == q_upper:
+            rank = 0
+        elif ticker.startswith(q_upper) and q_upper:
+            rank = 1
+        elif title_n == needle:
+            rank = 2
+        elif title_n.startswith(needle):
+            rank = 3
+        elif needle in title_n:
+            rank = 4
+        else:
+            continue
+        local.append((rank, len(title_n), ticker, item))
+    local.sort(key=lambda x: (x[0], x[1], x[2]))
+    for _, _, ticker, item in local[:limit]:
+        if ticker in seen:
+            continue
+        seen.add(ticker)
+        out.append({
+            "market": "US",
+            "ticker": ticker,
+            "name": item.get("title") or ticker,
+            "query": ticker,
+            "kind": "미국주식",
+        })
+        if len(out) >= limit:
+            return out
+
+    # Yahoo search broadens Korean-name support beyond the fixed alias map.
+    for quote in _yahoo_search_quotes(q, count=max(12, limit * 2)):
+        if str(quote.get("quoteType") or "").upper() != "EQUITY":
+            continue
+        ticker = str(quote.get("symbol") or "").upper().strip()
+        if not ticker or ticker in seen or ticker not in mp:
+            continue
+        exchange = str(quote.get("exchange") or "").upper()
+        if exchange in {"KSC", "KOE"} or ticker.endswith((".KS", ".KQ")):
+            continue
+        seen.add(ticker)
+        out.append({
+            "market": "US",
+            "ticker": ticker,
+            "name": str(quote.get("longname") or quote.get("shortname") or mp[ticker].get("title") or ticker),
+            "query": ticker,
+            "kind": "미국주식",
+        })
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+def search_symbols(market, q, limit=10):
+    market = str(market or "KR").upper()
+    if market == "KR":
+        return _search_kr(q, limit=limit)
+    if market == "US":
+        return _search_us(q, limit=limit)
+    raise RuntimeError("market은 KR 또는 US여야 합니다.")
+
+
+def _sec_company(q):
+    raw = str(q or "").strip()
+    q_upper = raw.upper()
+    mp = _load_sec_tickers()
+    if q_upper in mp:
+        return mp[q_upper]
+
+    alias_matches = _matching_us_aliases(raw)
+    if alias_matches:
+        ticker = alias_matches[0][3]
+        if ticker in mp:
+            return mp[ticker]
+
+    matches = [v for v in mp.values() if q_upper in str(v["title"]).upper()]
     if matches:
         matches.sort(key=lambda x: (len(x["title"]), x["title"]))
         return matches[0]
+
+    # Last resort for Korean or fuzzy company names: use Yahoo's localized
+    # search only to resolve a ticker, then require that ticker to exist in the
+    # repository-cached SEC universe before analysis.
+    for quote in _yahoo_search_quotes(raw, count=8):
+        ticker = str(quote.get("symbol") or "").upper().strip()
+        if str(quote.get("quoteType") or "").upper() == "EQUITY" and ticker in mp:
+            return mp[ticker]
+
     raise RuntimeError("SEC ticker 목록에서 해당 미국 종목을 찾지 못했습니다.")
 
 
@@ -2349,6 +2664,18 @@ class handler(BaseHTTPRequestHandler):
 
         if parsed.path in ("/", "/index.html"):
             return self._send_index()
+
+        if parsed.path == "/api/search":
+            try:
+                qs = parse_qs(parsed.query)
+                market = (qs.get("market", ["KR"])[0] or "KR").upper()
+                q = (qs.get("q", [""])[0] or "").strip()
+                if not q:
+                    return self._send(200, {"ok": True, "data": []})
+                results = search_symbols(market, q, limit=10)
+                return self._send(200, {"ok": True, "data": results})
+            except Exception as e:
+                return self._send(400, {"ok": False, "error": str(e)})
 
         if parsed.path != "/api/analyze":
             return self._send(404, {"ok": False, "error": "Not found"})
