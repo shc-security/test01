@@ -40,7 +40,7 @@ class HistoricalDart:
         if not self.key:
             raise RuntimeError("DART_API_KEY is required")
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "lattice-stock-analyzer-pit/0.3"})
+        self.session.headers.update({"User-Agent": "lattice-stock-analyzer-pit/0.4"})
         self.cache = Path(cache_dir or Path(__file__).resolve().parent / ".cache" / "pit_dart")
         self.cache.mkdir(parents=True, exist_ok=True)
 
@@ -89,12 +89,7 @@ class HistoricalDart:
         return candidates[-1][2]
 
     def xbrl_zip(self, receipt_no: str) -> bytes:
-        """Download XBRL for the exact 14-digit DART receipt number.
-
-        fnlttXbrl.xml expects the full receipt number returned by list.json.
-        Truncating it to the filing date produces status 013 (receipt error) and
-        defeats receipt-specific point-in-time validation.
-        """
+        """Download XBRL for the exact 14-digit DART receipt number."""
         rno = str(receipt_no).strip()
         if len(rno) != 14 or not rno.isdigit():
             raise ValueError(f"invalid DART receipt number: {receipt_no!r}")
@@ -161,15 +156,35 @@ class HistoricalDart:
 
 
 def is_financial_company(industry_code: str | None, corp_name: str | None = None) -> bool:
-    """Conservative financial-company gate for ROIC comparability."""
+    """Gate firms whose economics are not comparable to the non-financial ROIC model.
+
+    OpenDART company.json exposes the *current* KSIC code, so blanket use of 64-66
+    creates temporal classification leakage and false positives for historical
+    conglomerates/holding companies.  For the historical large-cap universe we
+    therefore require an unambiguous financial-business name signal.  The KSIC
+    code is retained only as corroboration, never as the sole reason to exclude.
+    """
     code = str(industry_code or "").strip()
     name = str(corp_name or "").replace(" ", "")
+
+    # Explicit non-financial / investment-vehicle exceptions.  These should not
+    # be silently called banks/insurers just because today's broad KSIC is 64xx.
     if code.startswith("64992"):
         return False
-    if any(x in name for x in ("SK", "LG", "CJ", "GS")) and ("지주" in name or name in {"SK", "LG", "CJ", "GS"}):
+    if name in {"SK", "LG", "CJ", "GS", "효성", "HDC", "오리온홀딩스", "롯데지주"}:
         return False
-    if code.startswith("65") or code.startswith("66"):
+
+    financial_tokens = (
+        "금융", "은행", "뱅크", "생명", "화재", "손해보험", "해상보험",
+        "증권", "카드", "캐피탈", "저축은행", "자산운용", "투자증권",
+    )
+    if any(tok in name for tok in financial_tokens):
         return True
-    if code.startswith("64"):
+
+    # Infrastructure/fund vehicles are also outside operating-company ROIC.
+    if "맥쿼리인프라" in name:
         return True
+
+    # Never exclude from the historical non-financial denominator solely from a
+    # present-day broad industry code; that would reintroduce look-ahead.
     return False
