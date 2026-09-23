@@ -3,7 +3,7 @@ from __future__ import annotations
 """Strict point-in-time wrapper around kr_point_in_time.
 
 Historical LFS inputs come only from the exact OpenDART annual-report receipt
-that was public by the ranking date.  Later restatements from today's financial
+that was public by the ranking date. Later restatements from today's financial
 API are never used as historical facts.
 """
 
@@ -17,16 +17,28 @@ from backtest.pit_dart import HistoricalDart, is_financial_company
 
 
 FLOW_TAGS = {
-    "revenue": ("RevenueFromContractsWithCustomers", "Revenue", "SalesRevenue", "OperatingRevenue"),
-    "operating_income": ("OperatingIncomeLoss", "OperatingProfitLoss"),
-    "net_income": ("ProfitLoss", "ProfitLossAttributableToOwnersOfParent"),
-    "cfo": ("CashFlowsFromUsedInOperatingActivities",),
-    "capex": ("PurchaseOfPropertyPlantAndEquipment", "PaymentsToAcquirePropertyPlantAndEquipment"),
+    "revenue": (
+        "RevenueFromContractsWithCustomers", "Revenue", "Sales", "SalesRevenue",
+        "OperatingRevenue", "RevenueFromRenderingOfServices", "Revenues",
+    ),
+    "operating_income": (
+        "OperatingIncomeLoss", "OperatingProfitLoss", "OperatingIncome", "OperatingProfit",
+    ),
+    "net_income": (
+        "ProfitLoss", "ProfitLossAttributableToOwnersOfParent", "NetIncomeLoss", "NetIncome",
+    ),
+    "cfo": (
+        "CashFlowsFromUsedInOperatingActivities", "NetCashFlowsFromUsedInOperatingActivities",
+    ),
+    "capex": (
+        "PurchaseOfPropertyPlantAndEquipment", "PaymentsToAcquirePropertyPlantAndEquipment",
+        "AcquisitionOfPropertyPlantAndEquipment", "PurchaseOfPropertyPlantAndEquipmentAndIntangibleAssets",
+    ),
 }
 BALANCE_TAGS = {
-    "assets": ("Assets",),
-    "equity": ("Equity", "EquityAttributableToOwnersOfParent"),
-    "cash": ("CashAndCashEquivalents",),
+    "assets": ("Assets", "TotalAssets"),
+    "equity": ("Equity", "EquityAttributableToOwnersOfParent", "TotalEquity"),
+    "cash": ("CashAndCashEquivalents", "CashAndCashEquivalentsAtEndOfPeriodCf"),
 }
 DEBT_TAGS = (
     "ShorttermBorrowings", "BorrowingsCurrent", "CurrentPortionOfLongtermBorrowings",
@@ -50,10 +62,21 @@ def _source_groups(facts, year):
     return groups
 
 
+def _tag_matches(tag, aliases):
+    if tag in aliases:
+        return True
+    low = str(tag or "").lower()
+    # Conservative extension-tag fallback. Custom Korean XBRL concepts often
+    # prefix/suffix a standard concept name; do not use broad words such as
+    # merely 'income' or 'sales' here because they can match subtotals.
+    strong = [a.lower() for a in aliases if len(a) >= 12]
+    return any(a in low or low in a for a in strong)
+
+
 def _flow_value(rows, tags, year):
     candidates = []
     for f in rows:
-        if f.get("tag") not in tags:
+        if not _tag_matches(f.get("tag"), tags):
             continue
         st, en = _iso(f.get("start")), _iso(f.get("end"))
         if not st or not en or en.year != year:
@@ -69,7 +92,7 @@ def _flow_value(rows, tags, year):
 def _instant_value(rows, tags, year):
     candidates = []
     for f in rows:
-        if f.get("tag") not in tags:
+        if not _tag_matches(f.get("tag"), tags):
             continue
         inst = _iso(f.get("instant"))
         if inst and inst.year == year:
@@ -110,8 +133,6 @@ def strict_snapshot_score(dart_unused, corp, ticker, asof, cap_snapshot):
     pit = HistoricalDart(cache_dir=base.CACHE_DIR / "pit_dart")
     latest_year = asof.year - 1
 
-    # Eligibility is decided before historical XBRL parsing. Financial firms are
-    # outside the ROIC model and therefore must not depress score coverage.
     info = {}
     try:
         info = dart_unused.company(corp["corp_code"])
@@ -122,10 +143,6 @@ def strict_snapshot_score(dart_unused, corp, ticker, asof, cap_snapshot):
 
     rows = []
     receipts = []
-    # Two annual periods are sufficient for a point-in-time score. Do not require
-    # FY2012 merely because a six-year history is desirable: early Korean XBRL
-    # packages are structurally incomplete for many otherwise eligible issuers.
-    # Try newest-to-oldest and keep every successfully parsed receipt, up to six.
     for fy in range(latest_year, max(2011, latest_year - 6), -1):
         rec = pit.annual_receipt(corp["corp_code"], fy, asof)
         if not rec:
@@ -137,8 +154,6 @@ def strict_snapshot_score(dart_unused, corp, ticker, asof, cap_snapshot):
             facts = pit.xbrl_facts(rec["rcept_no"])
             metric = _metrics_from_receipt(facts, fy)
         except (RuntimeError, ValueError):
-            # A missing/legacy old XBRL package is not fatal if newer point-in-time
-            # receipts provide enough history. Never substitute a later restatement.
             continue
         metric["_receipt_no"] = rec["rcept_no"]
         metric["_receipt_date"] = rdt
