@@ -43,6 +43,23 @@
     .raw span { color:#6b7280; font-size:12px; display:block; }
     .raw b { display:block; margin-top:3px; }
     .err { color:#b91c1c; white-space:pre-wrap; }
+    .search-wrap { position:relative; }
+    .suggestions {
+      position:absolute; left:0; right:0; top:calc(100% + 6px); z-index:30;
+      background:white; border:1px solid #d1d5db; border-radius:12px;
+      box-shadow:0 12px 30px rgba(0,0,0,.12); max-height:360px; overflow:auto;
+    }
+    .suggestion {
+      display:flex; align-items:center; justify-content:space-between; gap:12px;
+      width:100%; padding:11px 13px; border:0; border-bottom:1px solid #f3f4f6;
+      border-radius:0; background:white; color:#111827; text-align:left; font-weight:500;
+    }
+    .suggestion:last-child { border-bottom:0; }
+    .suggestion:hover,.suggestion.active { background:#f3f4f6; }
+    .suggestion-main { min-width:0; }
+    .suggestion-name { display:block; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .suggestion-meta { display:block; margin-top:2px; color:#6b7280; font-size:12px; }
+    .suggestion-code { flex:0 0 auto; font-size:12px; font-weight:800; color:#374151; }
     .hidden { display:none; }
     @media (max-width:700px) {
       body { padding:12px; }
@@ -66,7 +83,10 @@
         <option value="KR">한국</option>
         <option value="US">미국</option>
       </select>
-      <input id="q" placeholder="삼성전자 / 005930 / NVDA">
+      <div class="search-wrap">
+        <input id="q" placeholder="삼성 / 005930 / 애플 / NVDA" autocomplete="off" aria-autocomplete="list" aria-controls="suggestions">
+        <div id="suggestions" class="suggestions hidden" role="listbox"></div>
+      </div>
     </div>
     <button id="go">분석</button>
     <div id="status" class="muted" style="margin-top:12px"></div>
@@ -180,10 +200,132 @@ function addRaw(root, label, value) {
   root.appendChild(d);
 }
 
+
+var searchInput = document.getElementById("q");
+var marketSelect = document.getElementById("market");
+var suggestionBox = document.getElementById("suggestions");
+var searchTimer = null;
+var searchSeq = 0;
+var activeSuggestion = -1;
+var currentSuggestions = [];
+
+function escapeHtml(v) {
+  return String(v == null ? "" : v)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function hideSuggestions() {
+  suggestionBox.classList.add("hidden");
+  suggestionBox.innerHTML = "";
+  currentSuggestions = [];
+  activeSuggestion = -1;
+}
+
+function chooseSuggestion(item) {
+  searchInput.value = item.name + " (" + item.ticker + ")";
+  searchInput.dataset.analysisQuery = item.query || item.ticker;
+  hideSuggestions();
+  searchInput.focus();
+}
+
+function renderSuggestions(items) {
+  currentSuggestions = items || [];
+  activeSuggestion = -1;
+  if (!currentSuggestions.length) {
+    hideSuggestions();
+    return;
+  }
+  suggestionBox.innerHTML = currentSuggestions.map(function(item, i) {
+    return '<button type="button" class="suggestion" data-i="' + i + '" role="option">' +
+      '<span class="suggestion-main">' +
+        '<span class="suggestion-name">' + escapeHtml(item.name) + '</span>' +
+        '<span class="suggestion-meta">' + escapeHtml(item.kind || "") + '</span>' +
+      '</span>' +
+      '<span class="suggestion-code">' + escapeHtml(item.ticker) + '</span>' +
+    '</button>';
+  }).join("");
+  suggestionBox.classList.remove("hidden");
+  Array.prototype.forEach.call(suggestionBox.querySelectorAll(".suggestion"), function(btn) {
+    btn.addEventListener("mousedown", function(e) {
+      e.preventDefault();
+      var i = Number(btn.getAttribute("data-i"));
+      if (currentSuggestions[i]) chooseSuggestion(currentSuggestions[i]);
+    });
+  });
+}
+
+async function fetchSuggestions() {
+  var q = searchInput.value.trim();
+  delete searchInput.dataset.analysisQuery;
+  if (!q) { hideSuggestions(); return; }
+
+  var seq = ++searchSeq;
+  try {
+    var res = await fetch("/api/search?market=" + encodeURIComponent(marketSelect.value) + "&q=" + encodeURIComponent(q));
+    var body = await res.json();
+    if (seq !== searchSeq) return;
+    if (!res.ok || !body.ok) { hideSuggestions(); return; }
+    renderSuggestions(body.data || []);
+  } catch (_) {
+    if (seq === searchSeq) hideSuggestions();
+  }
+}
+
+searchInput.addEventListener("input", function() {
+  clearTimeout(searchTimer);
+  delete searchInput.dataset.analysisQuery;
+  searchTimer = setTimeout(fetchSuggestions, 180);
+});
+
+searchInput.addEventListener("keydown", function(e) {
+  if (suggestionBox.classList.contains("hidden") || !currentSuggestions.length) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      document.getElementById("go").click();
+    }
+    return;
+  }
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    activeSuggestion += e.key === "ArrowDown" ? 1 : -1;
+    if (activeSuggestion < 0) activeSuggestion = currentSuggestions.length - 1;
+    if (activeSuggestion >= currentSuggestions.length) activeSuggestion = 0;
+    Array.prototype.forEach.call(suggestionBox.querySelectorAll(".suggestion"), function(btn, i) {
+      btn.classList.toggle("active", i === activeSuggestion);
+    });
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    if (activeSuggestion >= 0 && currentSuggestions[activeSuggestion]) {
+      chooseSuggestion(currentSuggestions[activeSuggestion]);
+    } else if (currentSuggestions[0]) {
+      chooseSuggestion(currentSuggestions[0]);
+    }
+  } else if (e.key === "Escape") {
+    hideSuggestions();
+  }
+});
+
+marketSelect.addEventListener("change", function() {
+  searchInput.value = "";
+  delete searchInput.dataset.analysisQuery;
+  hideSuggestions();
+  searchInput.placeholder = this.value === "US"
+    ? "애플 / 엔비디아 / Tesla / NVDA"
+    : "삼성 / 삼성전자 / 005930";
+});
+
+document.addEventListener("click", function(e) {
+  if (!e.target.closest(".search-wrap")) hideSuggestions();
+});
+
 document.getElementById("go").onclick = async function() {
   var btn = this;
   var market = document.getElementById("market").value;
-  var q = document.getElementById("q").value.trim();
+  var qEl = document.getElementById("q");
+  var q = (qEl.dataset.analysisQuery || qEl.value).trim();
+  hideSuggestions();
   var status = document.getElementById("status");
   var err = document.getElementById("error");
   var result = document.getElementById("result");
