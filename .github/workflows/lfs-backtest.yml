@@ -117,7 +117,45 @@ jobs:
           --min-mapping-coverage 0.95
           --min-score-coverage 0.80
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: lfs-point-in-time-results
           path: backtest/out/
           retention-days: 90
+
+
+  diagnose2016:
+    if: contains(github.event.head_commit.message, '[diagnose-2016]')
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      DART_API_KEY: ${{ secrets.DART_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r backtest/requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: backtest/.cache
+          key: lfs-pit-dart-diagnose-2016-v1
+          restore-keys: |
+            lfs-pit-dart-v1-
+      - name: Run 2016 diagnostic cohort
+        run: >-
+          python backtest/kr_point_in_time.py
+          --start-year 2016
+          --end-year 2016
+          --universe-size 100
+          --top-n 10
+          --workers 4
+          --min-mapping-coverage 0
+          --min-score-coverage 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lfs-diagnose-2016
+          path: backtest/out/
+          retention-days: 30
