@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from argparse import Namespace
-from datetime import date
 
 import pandas as pd
 
@@ -19,111 +17,12 @@ from backtest.pit_dart import is_financial_company
 # failure. is_financial_company intentionally does not use current KSIC alone.
 EXPLICIT_FINANCIAL_NAMES = {"신한지주", "현대해상"}
 
-# BGF Retail (old 027410) was split on 2017-11-01 into surviving BGF
-# (027410) and newly listed BGF Retail (282330). One old share economically
-# became 0.6511658 BGF share + 0.3488342 BGF Retail share. A plain 027410
-# price series therefore creates a false ~97% loss after the demerger.
-BGF_DEMERGER_DATE = date(2017, 11, 1)
-BGF_SURVIVING_RATIO = 0.6511658
-BGF_SPINOFF_RATIO = 0.3488342
-BGF_SPINOFF_TICKER = "282330"
-
 
 def strict_snapshot_score(dart, corp, ticker, asof, cap_snapshot):
     name = str(corp.get("corp_name") or "").replace(" ", "")
     if name in EXPLICIT_FINANCIAL_NAMES or is_financial_company(None, name):
         raise ValueError("financial-sector company excluded: ROIC model is not comparable")
     return strict.strict_snapshot_score(dart, corp, ticker, asof, cap_snapshot)
-
-
-def _split_events(store, ticker: str):
-    """Infer mechanical stock splits/reverse-splits from Marcap shares and price."""
-    cache = getattr(store, "_strict_split_events", None)
-    if cache is None:
-        cache = {}
-        store._strict_split_events = cache
-    if ticker in cache:
-        return cache[ticker]
-
-    frames = []
-    for year in range(2015, date.today().year + 1):
-        try:
-            df = store.year(year)
-        except Exception:
-            continue
-        part = df[df["Code"] == ticker][["Date", "Close", "Stocks"]].copy()
-        if not part.empty:
-            frames.append(part)
-    if not frames:
-        cache[ticker] = []
-        return []
-
-    x = pd.concat(frames).sort_values("Date").drop_duplicates("Date", keep="last")
-    events = []
-    prev = None
-    for _, row in x.iterrows():
-        close = float(row["Close"]) if pd.notna(row["Close"]) else 0.0
-        shares = float(row["Stocks"]) if pd.notna(row["Stocks"]) else 0.0
-        if prev is not None and close > 0 and shares > 0 and prev[1] > 0 and prev[2] > 0:
-            sr = shares / prev[2]
-            pr = close / prev[1]
-            # >=20% share-count discontinuity, with market-cap continuity within 35%.
-            # This catches mechanical splits while avoiding ordinary issuance.
-            if (sr >= 1.20 or sr <= (1 / 1.20)) and abs(math.log(pr * sr)) <= math.log(1.35):
-                events.append((row["Date"], sr))
-        prev = (row["Date"], close, shares)
-    cache[ticker] = events
-    return events
-
-
-def _adjust_to_common_basis(store, ticker: str, px: float, dt):
-    """Put every quote on one post-event share basis.
-
-    Both entry and terminal quotes MUST pass through this function. If only the
-    entry is adjusted, a split after the horizon can manufacture enormous gains.
-    """
-    factor = 1.0
-    for event_date, ratio in _split_events(store, ticker):
-        if event_date > dt:
-            factor *= ratio
-    return float(px) / factor if factor else float(px)
-
-
-_ORIG_FIRST = base.MarcapStore.first_price_on_or_after
-_ORIG_LAST = base.MarcapStore.last_price_on_or_before
-_ORIG_TERMINAL = base.terminal_price
-
-
-def _adjusted_first(self, ticker, target, days=20):
-    found = _ORIG_FIRST(self, ticker, target, days)
-    if not found:
-        return None
-    px, dt = found
-    return _adjust_to_common_basis(self, ticker, px, dt), dt
-
-
-def _adjusted_last(self, ticker, start, target):
-    found = _ORIG_LAST(self, ticker, start, target)
-    if not found:
-        return None
-    px, dt = found
-    return _adjust_to_common_basis(self, ticker, px, dt), dt
-
-
-def _strict_terminal_price(marcap, ticker: str, start: date, target: date):
-    """Return a terminal value on the same split basis as the entry quote."""
-    if ticker == "027410" and start < BGF_DEMERGER_DATE <= target:
-        bgf = _ORIG_TERMINAL(marcap, ticker, BGF_DEMERGER_DATE, target)
-        retail = _ORIG_TERMINAL(marcap, BGF_SPINOFF_TICKER, BGF_DEMERGER_DATE, target)
-        bgf_px, bgf_dt, _ = bgf
-        retail_px, retail_dt, _ = retail
-        bgf_px = _adjust_to_common_basis(marcap, ticker, bgf_px, bgf_dt)
-        retail_px = _adjust_to_common_basis(marcap, BGF_SPINOFF_TICKER, retail_px, retail_dt)
-        synthetic = BGF_SURVIVING_RATIO * bgf_px + BGF_SPINOFF_RATIO * retail_px
-        return synthetic, max(bgf_dt, retail_dt), "demerger_total_value:027410+282330"
-
-    px, dt, source = _ORIG_TERMINAL(marcap, ticker, start, target)
-    return _adjust_to_common_basis(marcap, ticker, px, dt), dt, source
 
 
 def validate_eligible_coverage(start_year: int, end_year: int, minimum: float) -> None:
@@ -191,9 +90,6 @@ def validate_return_sanity():
     df = pd.read_csv(path)
     if df.empty:
         raise RuntimeError("no forward returns")
-    # Extreme losses commonly signal an unhandled demerger/delisting. Very large
-    # gains are also fail-closed because a basis mismatch can create 10x-100x
-    # phantom returns. They require manual review before publication.
     suspicious = df[((df["price_return"] <= -0.95) | (df["price_return"] >= 20.0)) & (df["horizon_years"] >= 3)]
     if not suspicious.empty:
         cols = ["cohort_year", "ticker", "name", "horizon_years", "start_price", "end_price", "price_return", "terminal_source"]
@@ -211,10 +107,11 @@ def main():
     p.add_argument("--min-score-coverage", type=float, default=0.80)
     args = p.parse_args()
 
+    # FinanceData/marcap is already split-adjusted historically. Applying an
+    # inferred split factor a second time corrupts long-horizon returns (e.g.
+    # SK hynix). Keep raw Marcap closes and fail closed on extreme returns so
+    # genuine demergers/delistings are still reviewed explicitly.
     base.snapshot_score = strict_snapshot_score
-    base.MarcapStore.first_price_on_or_after = _adjusted_first
-    base.MarcapStore.last_price_on_or_before = _adjusted_last
-    base.terminal_price = _strict_terminal_price
     run_args = Namespace(**vars(args))
     run_args.min_score_coverage = 0.0
     base.run(run_args)
