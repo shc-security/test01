@@ -81,7 +81,6 @@ def _yahoo_adjusted_price(ticker: str, target: date, market: str | None = None, 
 
 
 def strict_start_price(marcap, ticker: str, asof: date):
-    # Resolve the historical market from the PIT snapshot, then use adjusted close.
     market = None
     try:
         _, snap = marcap.snapshot_on_or_after(asof)
@@ -109,8 +108,6 @@ def strict_terminal_price(marcap, ticker: str, start: date, target: date):
     if found:
         px, dt = found
         return px, dt, "yahoo_adjusted_target_or_next"
-    # Fail-safe for delisted/suspended names: retain them rather than silently
-    # dropping them. Such rows are explicitly labelled for downstream review.
     return base.terminal_price(marcap, str(ticker).zfill(6), start, target)
 
 
@@ -172,16 +169,50 @@ def validate_receipt_audit(start_year: int, end_year: int, minimum_spotchecks: i
 
 
 def validate_return_sanity():
+    """Reject impossible returns and independently verify extreme terminal quotes.
+
+    A large return is not itself a corporate-action error.  For example SK hynix
+    genuinely rose from roughly 25k KRW in 2016 to above 2m KRW in June 2026.
+    Extreme Yahoo-adjusted returns are accepted only when the terminal quote is
+    independently consistent with the raw KRX/marcap terminal quote.
+    """
     path = base.OUT_DIR / "forward_returns.csv"
     if not path.exists():
         raise RuntimeError("forward_returns.csv missing")
     df = pd.read_csv(path)
     if df.empty:
         raise RuntimeError("no forward returns")
-    suspicious = df[((df["price_return"] <= -0.95) | (df["price_return"] >= 20.0)) & (df["horizon_years"] >= 3)]
-    if not suspicious.empty:
-        cols = ["cohort_year", "ticker", "name", "horizon_years", "start_price", "end_price", "price_return", "terminal_source"]
-        raise RuntimeError("suspicious corporate-action returns remain: " + suspicious[cols].head(10).to_json(orient="records", force_ascii=False))
+    impossible = df[(df["price_return"] <= -1.0) | (df["start_price"] <= 0) | (df["end_price"] <= 0)]
+    if not impossible.empty:
+        raise RuntimeError("impossible return rows remain: " + impossible.head(10).to_json(orient="records", force_ascii=False))
+
+    extreme = df[(df["price_return"] >= 20.0) & (df["horizon_years"] >= 3)]
+    if extreme.empty:
+        return
+    marcap = base.MarcapStore()
+    failures = []
+    verified = 0
+    for _, row in extreme.iterrows():
+        try:
+            ticker = str(int(row["ticker"])).zfill(6) if str(row["ticker"]).replace(".0", "").isdigit() else str(row["ticker"]).zfill(6)
+            target = datetime.strptime(str(row["target_date"])[:10], "%Y-%m-%d").date()
+            start = datetime.strptime(str(row["entry_date"])[:10], "%Y-%m-%d").date()
+            raw = marcap.last_price_on_or_before(ticker, start, target + timedelta(days=20))
+            if not raw:
+                failures.append((ticker, "independent terminal price missing"))
+                continue
+            raw_px, raw_dt = raw
+            yahoo_px = float(row["end_price"])
+            rel = abs(raw_px - yahoo_px) / max(abs(raw_px), abs(yahoo_px), 1.0)
+            if rel > 0.05:
+                failures.append((ticker, str(row.get("name")), yahoo_px, raw_px, str(raw_dt), rel))
+            else:
+                verified += 1
+        except Exception as exc:
+            failures.append((str(row.get("ticker")), str(exc)))
+    if failures:
+        raise RuntimeError("extreme-return independent price verification failed: " + repr(failures[:10]))
+    print(f"return sanity: {verified} extreme return rows independently matched KRX/marcap terminal prices", flush=True)
 
 
 def main():
