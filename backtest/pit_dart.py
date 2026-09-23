@@ -40,7 +40,7 @@ class HistoricalDart:
         if not self.key:
             raise RuntimeError("DART_API_KEY is required")
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "lattice-stock-analyzer-pit/0.4"})
+        self.session.headers.update({"User-Agent": "lattice-stock-analyzer-pit/0.5"})
         self.cache = Path(cache_dir or Path(__file__).resolve().parent / ".cache" / "pit_dart")
         self.cache.mkdir(parents=True, exist_ok=True)
 
@@ -57,10 +57,17 @@ class HistoricalDart:
         time.sleep(0.08)
         return data
 
-    def annual_receipt(self, corp_code: str, business_year: int, asof: date) -> dict | None:
+    def annual_receipts(self, corp_code: str, business_year: int, asof: date) -> list[dict]:
+        """Return all annual-report receipts that were public by *asof*, newest first.
+
+        DART amendments are separate receipts and some amendment receipts do not
+        expose a downloadable XBRL package.  Keeping every historical receipt lets
+        the caller try the newest parseable receipt without ever crossing the
+        point-in-time boundary.
+        """
         bgn = date(business_year + 1, 1, 1)
         if asof < bgn:
-            return None
+            return []
         data = self._json(
             "list.json",
             {
@@ -83,10 +90,12 @@ class HistoricalDart:
                 continue
             if len(rdt) == 8 and rdt.isdigit() and rdt <= asof.strftime("%Y%m%d"):
                 candidates.append((rdt, rno, row))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda x: (x[0], x[1]))
-        return candidates[-1][2]
+        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        return [x[2] for x in candidates]
+
+    def annual_receipt(self, corp_code: str, business_year: int, asof: date) -> dict | None:
+        rows = self.annual_receipts(corp_code, business_year, asof)
+        return rows[0] if rows else None
 
     def xbrl_zip(self, receipt_no: str) -> bytes:
         """Download XBRL for the exact 14-digit DART receipt number."""
@@ -167,8 +176,6 @@ def is_financial_company(industry_code: str | None, corp_name: str | None = None
     code = str(industry_code or "").strip()
     name = str(corp_name or "").replace(" ", "")
 
-    # Explicit non-financial / investment-vehicle exceptions.  These should not
-    # be silently called banks/insurers just because today's broad KSIC is 64xx.
     if code.startswith("64992"):
         return False
     if name in {"SK", "LG", "CJ", "GS", "효성", "HDC", "오리온홀딩스", "롯데지주"}:
@@ -180,11 +187,6 @@ def is_financial_company(industry_code: str | None, corp_name: str | None = None
     )
     if any(tok in name for tok in financial_tokens):
         return True
-
-    # Infrastructure/fund vehicles are also outside operating-company ROIC.
     if "맥쿼리인프라" in name:
         return True
-
-    # Never exclude from the historical non-financial denominator solely from a
-    # present-day broad industry code; that would reintroduce look-ahead.
     return False
