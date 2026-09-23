@@ -628,6 +628,24 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         w.writerows(rows)
 
 
+
+def categorize_error(message: str) -> str:
+    m = str(message or "").lower()
+    if "financial-sector company excluded" in m:
+        return "financial_sector_excluded"
+    if "latest annual statement" in m or "insufficient historical financial periods" in m:
+        return "insufficient_financial_history"
+    if "receipt date missing" in m or "look-ahead" in m:
+        return "filing_date_validation"
+    if "market cap missing" in m or "entry price unavailable" in m:
+        return "market_price_mapping"
+    if "OpenDART" in str(message) or "dart" in m:
+        return "dart_api_or_parsing"
+    if "품질 점수" in str(message) or "재무 데이터" in str(message):
+        return "financial_metric_parsing"
+    return "other"
+
+
 def run(args):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     dart = DartCache(os.environ.get("DART_API_KEY", ""))
@@ -703,6 +721,7 @@ def run(args):
                     {
                         "ticker": cap_row["ticker"],
                         "name": corp.get("corp_name"),
+                        "category": categorize_error(str(exc)),
                         "error": str(exc),
                     },
                 )
@@ -730,19 +749,28 @@ def run(args):
             row["asof_date"] = asof.isoformat()
             all_rank_rows.append(row)
 
-        cohort_audits.append(
-            {
-                "cohort_year": year,
-                "asof_date": asof.isoformat(),
-                "requested_corporations": args.universe_size,
-                "scanned_securities": scanned_securities,
-                "mapped_corporations": len(mapped),
-                "scored_corporations": len(scored),
-                "mapping_coverage": mapping_coverage,
-                "score_coverage": score_coverage,
-                "errors_sample": errors[:20],
-            }
-        )
+        error_counts = {}
+        for e in errors:
+            cat = e.get("category") or "other"
+            error_counts[cat] = error_counts.get(cat, 0) + 1
+
+        cohort_audit = {
+            "cohort_year": year,
+            "asof_date": asof.isoformat(),
+            "requested_corporations": args.universe_size,
+            "scanned_securities": scanned_securities,
+            "mapped_corporations": len(mapped),
+            "scored_corporations": len(scored),
+            "mapping_coverage": mapping_coverage,
+            "score_coverage": score_coverage,
+            "error_counts": error_counts,
+            "errors": errors,
+        }
+        cohort_audits.append(cohort_audit)
+
+        # Persist diagnostics before any validation gate can stop the run.
+        _json_dump(OUT_DIR / f"audit_{year}.json", cohort_audit)
+        write_csv(OUT_DIR / f"errors_{year}.csv", errors)
 
         if mapping_coverage < args.min_mapping_coverage:
             raise RuntimeError(
