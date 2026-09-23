@@ -102,31 +102,30 @@ def _metrics_from_receipt(facts, year):
             best, best_key = m, key
             best["_source_file"] = source
     if not best or best.get("revenue") is None or best.get("operating_income") is None:
-        raise ValueError(f"receipt XBRL metric parsing incomplete for FY{year}")
+        tags = sorted({str(f.get("tag") or "") for f in facts if (_iso(f.get("end") or f.get("instant")) and _iso(f.get("end") or f.get("instant")).year == year)})
+        likely = [t for t in tags if any(k in t.lower() for k in ("revenue", "sales", "operat", "profit", "income"))][:30]
+        raise ValueError(f"receipt XBRL metric parsing incomplete for FY{year}; likely_tags={likely}")
     best["year"] = year
     best["_fs_div"] = "receipt-xbrl"
     return best
 
 
 def _latest_parseable_receipt(pit, corp_code, fy, asof):
-    """Newest receipt available by asof whose own XBRL can be parsed.
-
-    An amendment without an XBRL package must not make a company disappear from
-    the historical universe. Falling back to an older receipt is safe because
-    that older receipt was already public at the same as-of date.
-    """
     failures = []
-    for rec in pit.annual_receipts(corp_code, fy, asof):
+    receipts = pit.annual_receipts(corp_code, fy, asof)
+    for rec in receipts:
         rdt = str(rec.get("rcept_dt") or rec.get("rcept_no", "")[:8])
         if len(rdt) != 8 or not rdt.isdigit() or rdt > asof.strftime("%Y%m%d"):
             raise ValueError(f"look-ahead receipt detected FY{fy}: {rdt} > {asof:%Y%m%d}")
         try:
             facts = pit.xbrl_facts(rec["rcept_no"])
             metric = _metrics_from_receipt(facts, fy)
-            return rec, metric
+            return rec, metric, failures
         except (RuntimeError, ValueError) as exc:
             failures.append(f"{rec.get('rcept_no')}: {exc}")
-    return None, None
+    if not receipts:
+        failures.append("no annual-report receipt found by as-of date")
+    return None, None, failures
 
 
 def strict_snapshot_score(dart_unused, corp, ticker, asof, cap_snapshot):
@@ -141,8 +140,11 @@ def strict_snapshot_score(dart_unused, corp, ticker, asof, cap_snapshot):
         raise ValueError("financial-sector company excluded: ROIC model is not comparable")
 
     rows, receipts = [], []
+    parse_failures = {}
     for fy in range(latest_year, max(2011, latest_year - 6), -1):
-        rec, metric = _latest_parseable_receipt(pit, corp["corp_code"], fy, asof)
+        rec, metric, failures = _latest_parseable_receipt(pit, corp["corp_code"], fy, asof)
+        if failures:
+            parse_failures[fy] = failures
         if not rec or not metric:
             continue
         rdt = str(rec.get("rcept_dt") or rec.get("rcept_no", "")[:8])
@@ -154,9 +156,11 @@ def strict_snapshot_score(dart_unused, corp, ticker, asof, cap_snapshot):
     rows.sort(key=lambda x: x["year"])
     receipts.sort(key=lambda x: x["year"])
     if not rows or rows[-1]["year"] != latest_year:
-        raise ValueError("latest annual statement is unavailable point-in-time")
+        detail = parse_failures.get(latest_year, [])[:3]
+        raise ValueError(f"latest annual statement is unavailable point-in-time; FY{latest_year} diagnostics={detail}")
     if len(rows) < 2:
-        raise ValueError("insufficient historical financial periods")
+        detail = {y: v[:2] for y, v in parse_failures.items() if y != latest_year}
+        raise ValueError(f"insufficient historical financial periods; diagnostics={detail}")
     rows = rows[-6:]
     receipts = [r for r in receipts if r["year"] in {x["year"] for x in rows}]
     latest = rows[-1]
