@@ -2,15 +2,14 @@ from __future__ import annotations
 
 """Strict point-in-time wrapper around kr_point_in_time.
 
-The legacy runner is retained for universe/price/return plumbing, but every
-historical LFS score is replaced here with metrics extracted from the exact
-OpenDART annual-report receipt that was public by the ranking date.  No
-fnlttSinglAcnt(All) values are used for historical scoring.
+Historical LFS inputs come only from the exact OpenDART annual-report receipt
+that was public by the ranking date.  Later restatements from today's financial
+API are never used as historical facts.
 """
 
 import argparse
 from collections import Counter, defaultdict
-from datetime import date, datetime
+from datetime import datetime
 
 from api import analyze as lfs
 from backtest import kr_point_in_time as base
@@ -43,12 +42,11 @@ def _iso(s):
 
 
 def _source_groups(facts, year):
-    """Group facts by instance file and keep sources that contain FY facts."""
     groups = defaultdict(list)
     for f in facts:
         end = _iso(f.get("end") or f.get("instant"))
         if end and end.year == year:
-            groups[f.get("source_file") or ""] .append(f)
+            groups[f.get("source_file") or ""].append(f)
     return groups
 
 
@@ -60,14 +58,10 @@ def _flow_value(rows, tags, year):
         st, en = _iso(f.get("start")), _iso(f.get("end"))
         if not st or not en or en.year != year:
             continue
-        days = (en - st).days
-        # Annual income/cash-flow contexts. Korean Dec-year issuers are normally 364/365 days.
-        if 330 <= days <= 380:
+        if 330 <= (en - st).days <= 380:
             candidates.append(float(f["value"]))
     if not candidates:
         return None
-    # Duplicate contexts (presentation/segment variants) are common. Prefer the modal
-    # exact numeric value; ties resolve deterministically by absolute magnitude.
     counts = Counter(candidates)
     return sorted(counts, key=lambda v: (-counts[v], -abs(v), v))[0]
 
@@ -100,9 +94,6 @@ def _metrics_from_receipt(facts, year):
         m["debt"] = sum(debt_parts) if debt_parts else None
         if m.get("capex") is not None:
             m["capex"] = abs(m["capex"])
-        # LFS needs revenue/op income plus balance-sheet support. Prefer the richest
-        # instance; then prefer the larger asset base, which resolves CFS vs OFS in
-        # the expected direction without consulting a later API snapshot.
         coverage = sum(m.get(k) is not None for k in ("revenue", "operating_income", "net_income", "assets", "equity", "cash", "cfo", "capex"))
         key = (coverage, abs(m.get("assets") or 0.0), source)
         if best is None or key > best_key:
@@ -117,41 +108,10 @@ def _metrics_from_receipt(facts, year):
 
 def strict_snapshot_score(dart_unused, corp, ticker, asof, cap_snapshot):
     pit = HistoricalDart(cache_dir=base.CACHE_DIR / "pit_dart")
-    score_year = asof.year
-    latest_year = score_year - 1
-    rows = []
-    receipts = []
-    # Each year's metric comes from that year's own annual-report receipt, not a
-    # comparative column in a later filing. This prevents later restatements from
-    # rewriting the historical information set.
-    for fy in range(max(2012, latest_year - 5), latest_year + 1):
-        rec = pit.annual_receipt(corp["corp_code"], fy, asof)
-        if not rec:
-            continue
-        rdt = str(rec.get("rcept_dt") or rec.get("rcept_no", "")[:8])
-        if len(rdt) != 8 or rdt > asof.strftime("%Y%m%d"):
-            raise ValueError(f"look-ahead receipt detected FY{fy}: {rdt} > {asof:%Y%m%d}")
-        facts = pit.xbrl_facts(rec["rcept_no"])
-        metric = _metrics_from_receipt(facts, fy)
-        metric["_receipt_no"] = rec["rcept_no"]
-        metric["_receipt_date"] = rdt
-        rows.append(metric)
-        receipts.append({"year": fy, "rcept_no": rec["rcept_no"], "rcept_dt": rdt, "source_file": metric.get("_source_file")})
+    latest_year = asof.year - 1
 
-    rows.sort(key=lambda x: x["year"])
-    if not rows or rows[-1]["year"] != latest_year:
-        raise ValueError("latest annual statement is unavailable point-in-time")
-    if len(rows) < 2:
-        raise ValueError("insufficient historical financial periods")
-    rows = rows[-6:]
-    latest = rows[-1]
-
-    cap_row = cap_snapshot.get(ticker)
-    if not cap_row:
-        raise ValueError("historical KRX market cap missing")
-
-    # Company metadata is used only to gate financial-sector comparability; no
-    # financial amount is sourced from company.json.
+    # Eligibility is decided before historical XBRL parsing. Financial firms are
+    # outside the ROIC model and therefore must not depress score coverage.
     info = {}
     try:
         info = dart_unused.company(corp["corp_code"])
@@ -159,10 +119,48 @@ def strict_snapshot_score(dart_unused, corp, ticker, asof, cap_snapshot):
         pass
     if is_financial_company(info.get("induty_code"), corp.get("corp_name")):
         raise ValueError("financial-sector company excluded: ROIC model is not comparable")
+
+    rows = []
+    receipts = []
+    # Two annual periods are sufficient for a point-in-time score. Do not require
+    # FY2012 merely because a six-year history is desirable: early Korean XBRL
+    # packages are structurally incomplete for many otherwise eligible issuers.
+    # Try newest-to-oldest and keep every successfully parsed receipt, up to six.
+    for fy in range(latest_year, max(2011, latest_year - 6), -1):
+        rec = pit.annual_receipt(corp["corp_code"], fy, asof)
+        if not rec:
+            continue
+        rdt = str(rec.get("rcept_dt") or rec.get("rcept_no", "")[:8])
+        if len(rdt) != 8 or rdt > asof.strftime("%Y%m%d"):
+            raise ValueError(f"look-ahead receipt detected FY{fy}: {rdt} > {asof:%Y%m%d}")
+        try:
+            facts = pit.xbrl_facts(rec["rcept_no"])
+            metric = _metrics_from_receipt(facts, fy)
+        except (RuntimeError, ValueError):
+            # A missing/legacy old XBRL package is not fatal if newer point-in-time
+            # receipts provide enough history. Never substitute a later restatement.
+            continue
+        metric["_receipt_no"] = rec["rcept_no"]
+        metric["_receipt_date"] = rdt
+        rows.append(metric)
+        receipts.append({"year": fy, "rcept_no": rec["rcept_no"], "rcept_dt": rdt, "source_file": metric.get("_source_file")})
+
+    rows.sort(key=lambda x: x["year"])
+    receipts.sort(key=lambda x: x["year"])
+    if not rows or rows[-1]["year"] != latest_year:
+        raise ValueError("latest annual statement is unavailable point-in-time")
+    if len(rows) < 2:
+        raise ValueError("insufficient historical financial periods")
+    rows = rows[-6:]
+    receipts = [r for r in receipts if r["year"] in {x["year"] for x in rows}]
+    latest = rows[-1]
+
+    cap_row = cap_snapshot.get(ticker)
+    if not cap_row:
+        raise ValueError("historical KRX market cap missing")
+
     sector = lfs._sector_from_kr_industry(info.get("induty_code"))
     if sector == "Financials":
-        # Non-financial holding companies can carry a 64xxx code. Avoid applying
-        # financial-sector benchmarks after they have passed the explicit gate.
         sector = "General"
 
     equity_cap = cap_row["market_cap"]
