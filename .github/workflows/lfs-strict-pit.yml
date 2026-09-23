@@ -20,6 +20,7 @@ jobs:
     timeout-minutes: 360
     env:
       DART_API_KEY: ${{ secrets.DART_API_KEY }}
+      PYTHONPATH: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -37,7 +38,7 @@ jobs:
           restore-keys: |
             lfs-strict-pit-v2-
       - name: Run strict 2016-2025 point-in-time backtest
-        run: python backtest/kr_point_in_time_v2.py --start-year 2016 --end-year 2025 --universe-size 100 --top-n 10 --workers 4 --min-mapping-coverage 0.95 --min-score-coverage 0.80
+        run: python -m backtest.kr_point_in_time_v2 --start-year 2016 --end-year 2025 --universe-size 100 --top-n 10 --workers 4 --min-mapping-coverage 0.95 --min-score-coverage 0.80
       - uses: actions/upload-artifact@v4
         if: always()
         with:
