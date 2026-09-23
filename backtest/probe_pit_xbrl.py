@@ -6,9 +6,11 @@ from pathlib import Path
 
 from backtest.pit_dart import HistoricalDart
 
-# Ten large historical issuers used only as source-integrity spot checks.
-# corp_code is resolved from official corpCode.xml at runtime to avoid stale IDs.
-TICKERS = ["005930", "005380", "000660", "005490", "012330", "000270", "015760", "055550", "017670", "105560"]
+# Ten non-financial large historical issuers used only as source-integrity
+# spot checks. Financial companies are intentionally excluded because the LFS
+# non-financial model excludes them and some 2015 financial-company filings do
+# not expose an XBRL ZIP through fnlttXbrl.
+TICKERS = ["005930", "005380", "000660", "005490", "012330", "000270", "015760", "017670", "035420", "051910"]
 
 
 def main():
@@ -37,8 +39,8 @@ def main():
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(out, ensure_ascii=False, indent=2))
-    if sum(1 for x in out if x.get("ok")) < 10:
-        raise SystemExit("PIT XBRL probe failed: fewer than 10/10 source checks passed")
+    if sum(1 for x in out if x.get("ok")) < len(TICKERS):
+        raise SystemExit(f"PIT XBRL probe failed: fewer than {len(TICKERS)}/{len(TICKERS)} source checks passed")
 
 
 def _corp_codes(d):
