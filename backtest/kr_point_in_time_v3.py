@@ -17,6 +17,22 @@ from backtest.pit_dart import is_financial_company
 EXPLICIT_FINANCIAL_NAMES = {"신한지주", "현대해상"}
 _PRICE_CACHE = {}
 
+# Explicit shareholder-wealth bridges for demergers that make a single successor
+# ticker economically non-comparable with the pre-event security.  The ratios are
+# shares received per one pre-demerger share.  BGF Retail (old 027410) was split
+# into surviving BGF (027410) and new BGF Retail (282330) at 0.6511658:0.3488342;
+# both were relisted on 2017-12-08.  Forward returns crossing this event therefore
+# use the combined value of both securities rather than silently treating BGF alone
+# as the continuation of the old operating company.
+DEMERGER_WEALTH_BRIDGES = {
+    "027410": {
+        "effective_date": date(2017, 11, 1),
+        "relist_date": date(2017, 12, 8),
+        "components": (("027410", 0.6511658), ("282330", 0.3488342)),
+        "source_note": "BGF/BGF Retail 2017 human demerger 0.6511658:0.3488342",
+    }
+}
+
 
 def strict_snapshot_score(dart, corp, ticker, asof, cap_snapshot):
     name = str(corp.get("corp_name") or "").replace(" ", "")
@@ -95,7 +111,32 @@ def strict_start_price(marcap, ticker: str, asof: date):
     return base.MarcapStore.first_price_on_or_after(marcap, str(ticker).zfill(6), asof, days=20)
 
 
+def _component_price(marcap, ticker: str, target: date):
+    found = _yahoo_adjusted_price(ticker, target, "KOSPI", True)
+    if found:
+        return found
+    return base.MarcapStore.first_price_on_or_after(marcap, str(ticker).zfill(6), target, days=20)
+
+
 def strict_terminal_price(marcap, ticker: str, start: date, target: date):
+    bridge = DEMERGER_WEALTH_BRIDGES.get(str(ticker).zfill(6))
+    if bridge and start < bridge["effective_date"] and target >= bridge["relist_date"]:
+        component_values = []
+        component_dates = []
+        for component_ticker, ratio in bridge["components"]:
+            found = _component_price(marcap, component_ticker, target)
+            if not found:
+                raise RuntimeError(
+                    f"demerger component price missing: {ticker}->{component_ticker} at {target}"
+                )
+            px, dt = found
+            component_values.append(float(px) * float(ratio))
+            component_dates.append(dt)
+        # All components are valued on the first available session on/after the
+        # contractual target.  The synthetic value represents wealth retained by
+        # an investor who held every share distributed in the human demerger.
+        return sum(component_values), max(component_dates), "demerger_total_shareholder_wealth"
+
     market = None
     try:
         _, snap = marcap.snapshot_on_or_after(start)
@@ -176,13 +217,7 @@ def _add_years(d: date, years: int) -> date:
 
 
 def validate_return_sanity():
-    """Reject impossible returns and independently verify extreme terminal quotes.
-
-    The forward-return CSV intentionally stores only the cohort as-of date, not a
-    redundant target-date column. Reconstruct the contractual horizon from that
-    date and independently compare the terminal quote with KRX/marcap. This check
-    is deliberately independent of the Yahoo adjusted series used for the return.
-    """
+    """Reject impossible returns and independently verify extreme terminal quotes."""
     path = base.OUT_DIR / "forward_returns.csv"
     if not path.exists():
         raise RuntimeError("forward_returns.csv missing")
@@ -192,6 +227,17 @@ def validate_return_sanity():
     impossible = df[(df["price_return"] <= -1.0) | (df["start_price"] <= 0) | (df["end_price"] <= 0)]
     if not impossible.empty:
         raise RuntimeError("impossible return rows remain: " + impossible.head(10).to_json(orient="records", force_ascii=False))
+
+    # A >90% loss across a demerger is often a false continuation caused by
+    # following only the surviving ticker.  Such rows must have used the explicit
+    # shareholder-wealth bridge above; otherwise fail loudly.
+    suspicious_losses = df[(df["price_return"] < -0.90) & (df["horizon_years"] >= 1)]
+    unbridged = suspicious_losses[
+        suspicious_losses["terminal_source"].astype(str) != "demerger_total_shareholder_wealth"
+    ]
+    if not unbridged.empty:
+        cols = ["cohort_year", "ticker", "name", "horizon_years", "price_return", "terminal_source"]
+        raise RuntimeError("suspicious unbridged corporate-action returns remain: " + unbridged[cols].head(10).to_json(orient="records", force_ascii=False))
 
     extreme = df[(df["price_return"] >= 20.0) & (df["horizon_years"] >= 3)]
     if extreme.empty:
