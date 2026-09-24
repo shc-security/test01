@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LFS 검증 백테스트</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111827;background:#f3f4f6}*{box-sizing:border-box}body{margin:0;padding:20px}.wrap{max-width:1100px;margin:auto}.card{background:#fff;border-radius:18px;padding:20px;margin-bottom:16px;box-shadow:0 6px 24px rgba(0,0,0,.06)}h1{margin:0 0 8px}h2{font-size:20px;margin:0 0 12px}.muted{color:#6b7280;font-size:13px;line-height:1.6}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.metric{background:#f9fafb;border-radius:12px;padding:14px}.metric b{display:block;font-size:22px;margin-top:5px}.ok{display:inline-block;background:#dcfce7;color:#166534;border-radius:999px;padding:6px 10px;font-weight:700;font-size:12px}.warn{background:#fff7ed;border-radius:12px;padding:13px;line-height:1.55;font-size:13px}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:9px 7px;border-bottom:1px solid #e5e7eb;text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}th{color:#4b5563}.scroll{overflow:auto}a{color:#111827;font-weight:700}@media(max-width:760px){body{padding:12px}.grid{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body><div class="wrap">
+<div class="card"><span class="ok">STRICT PIT 검증 통과</span><h1 style="margin-top:10px">LFS 점수 과거 백테스트</h1><div class="muted">2016~2025년 각 6월 초 시점에 실제로 공개돼 있던 공시만 사용해 당시 시가총액 상위 100개 기업을 재구성하고 LFS 점수 상위 10개를 추적했습니다. 금융업은 ROIC 모델 비교가 부적절해 제외했습니다. 결과 생성: 2026-09-24.</div></div>
+<div class="card"><h2>검증 상태</h2><div class="grid"><div class="metric"><span class="muted">종목 매핑</span><b>100%</b></div><div class="metric"><span class="muted">적격 비금융 점수 산출</span><b>86.6~98.8%</b></div><div class="metric"><span class="muted">공시시점 감사</span><b>100개 행</b></div><div class="metric"><span class="muted">코호트</span><b>10년</b></div></div><div class="muted" style="margin-top:12px">검증 게이트: 매핑률 ≥95%, 적격 비금융 점수 산출률 ≥80%. 접수번호별 원본 공시/XBRL의 접수일이 평가일 이후인 데이터는 사용하지 않습니다. 우선주/중복 주식종류를 기업 단위로 중복 제거하고, 상장폐지·거래정지 종목을 결과에서 조용히 제거하지 않습니다. 액면분할 가격은 조정주가를 사용하며 BGF 2017 인적분할처럼 단일 티커 연속성이 깨지는 사례는 분할 후 받은 전체 주식의 주주가치로 연결했습니다.</div></div>
+<div class="card"><h2>Top 10 동일가중 성과</h2><div class="scroll"><table><thead><tr><th>보유기간</th><th>코호트 수</th><th>평균수익률</th><th>중앙값</th><th>시장초과</th><th>Score↔수익 Spearman</th><th>95% CI</th><th>표본력</th></tr></thead><tbody>
+<tr><td>1년</td><td>10</td><td>17.8%</td><td>1.1%</td><td>-9.5%p</td><td>0.165</td><td>-15.7% ~ 51.2%</td><td>중간</td></tr>
+<tr><td>3년</td><td>8</td><td>20.9%</td><td>-0.1%</td><td>-16.5%p</td><td>0.106</td><td>-25.2% ~ 66.9%</td><td>중간</td></tr>
+<tr><td>5년</td><td>6</td><td>22.3%</td><td>11.7%</td><td>-26.2%p</td><td>0.104</td><td>1.5% ~ 43.1%</td><td>중간</td></tr>
+<tr><td>10년</td><td>1</td><td>1088.5%</td><td>1088.5%</td><td>+745.3%p</td><td>0.188</td><td>-</td><td>매우 낮음</td></tr>
+</tbody></table></div><div class="warn" style="margin-top:12px"><b>해석 주의:</b> 10년 결과는 2016년 코호트 1개뿐이라 일반화하면 안 됩니다. 특히 SK하이닉스의 장기 급등 영향이 큽니다. 1·3·5년에서도 신뢰구간이 넓고, 평균 시장초과수익은 음수입니다. 따라서 현재 결과는 “LFS 점수가 높을수록 미래수익률이 확실히 높다”는 강한 증거가 아닙니다.</div></div>
+<div class="card"><h2>점수 순위별 수익률</h2><div class="muted" style="margin-bottom:10px">평균수익률 / 상승확률. 10년은 각 순위당 n=1이라 참고용입니다.</div><div class="scroll"><table><thead><tr><th>순위</th><th>1년 (n=10)</th><th>3년 (n=8)</th><th>5년 (n=6)</th><th>10년 (n=1)</th></tr></thead><tbody>
+<tr><td>1</td><td>26.1% / 40%</td><td>15.4% / 50%</td><td>87.7% / 50%</td><td>9305.5% / 100%</td></tr>
+<tr><td>2</td><td>35.5% / 70%</td><td>45.4% / 75%</td><td>28.4% / 83%</td><td>-4.3% / 0%</td></tr>
+<tr><td>3</td><td>7.5% / 50%</td><td>-20.1% / 13%</td><td>-31.3% / 17%</td><td>1.5% / 100%</td></tr>
+<tr><td>4</td><td>-5.4% / 40%</td><td>-10.7% / 50%</td><td>-15.3% / 33%</td><td>-4.2% / 0%</td></tr>
+<tr><td>5</td><td>27.9% / 50%</td><td>59.6% / 75%</td><td>93.0% / 100%</td><td>1577.1% / 100%</td></tr>
+<tr><td>6</td><td>18.5% / 70%</td><td>37.3% / 50%</td><td>-15.0% / 17%</td><td>14.9% / 100%</td></tr>
+<tr><td>7</td><td>6.3% / 50%</td><td>11.6% / 50%</td><td>-2.2% / 17%</td><td>-85.7% / 0%</td></tr>
+<tr><td>8</td><td>54.2% / 50%</td><td>25.0% / 50%</td><td>84.2% / 50%</td><td>10.8% / 100%</td></tr>
+<tr><td>9</td><td>-1.7% / 40%</td><td>66.9% / 25%</td><td>0.4% / 33%</td><td>-71.7% / 0%</td></tr>
+<tr><td>10</td><td>8.7% / 20%</td><td>-21.6% / 25%</td><td>-7.1% / 50%</td><td>141.6% / 100%</td></tr>
+</tbody></table></div></div>
+<div class="card"><h2>방법론과 한계</h2><div class="muted">평가 유니버스는 해당 시점 KOSPI/KOSDAQ 시가총액 자료에서 DART 기업으로 매핑 가능한 상위 100개 기업입니다. 평가일은 각 연도 6월 1일 이후 첫 거래일입니다. 사업보고서와 사용 가능한 1분기 공시는 반드시 평가일 이전 접수분만 사용합니다. 비교 벤치마크는 종목이 속한 시장에 따라 KOSPI 또는 KOSDAQ 지수입니다. 수익률은 배당 재투자 총수익률이 아니라 가격수익률 중심이며, 과거 공시 파싱이 불충분한 기업은 오류 유형을 기록한 뒤 점수에서 제외합니다. 금융회사는 별도 금융업 모델이 없어 제외했습니다. 이 백테스트는 투자수익을 보장하지 않으며 표본 수가 작고 대형주 중심이라는 제한이 있습니다.</div><div style="margin-top:14px"><a href="/">← 종목 분석기로 돌아가기</a></div></div>
+</div></body></html>
