@@ -1,0 +1,32 @@
+name: LFS 2.0 research
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - 'backtest/lfs2_research.py'
+      - '.github/workflows/lfs2-research.yml'
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      DART_API_KEY: ${{ secrets.DART_API_KEY }}
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r backtest/requirements.txt
+      - name: Validate research harness
+        run: python -m py_compile backtest/lfs2_research.py
+      - name: Create reproducible LFS 2.0 experiment manifest
+        run: python -m backtest.lfs2_research
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lfs2-research
+          path: backtest/out/lfs2_research_manifest.json
+          retention-days: 90
