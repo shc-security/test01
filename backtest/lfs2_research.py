@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 OUT = Path(__file__).resolve().parent / "out"
+RESEARCH_VERSION = 1
 
 
 def main() -> None:
@@ -20,12 +21,9 @@ def main() -> None:
         "lfs_value_momentum": ["lfs", "value", "momentum"],
         "lfs_value_momentum_earnings": ["lfs", "value", "momentum", "earnings_revision"],
     }
-    # This manifest makes the experiment explicit and reproducible. The strict
-    # PIT engine must provide point-in-time factor observations before a model
-    # can be declared valid; absence of those fields is a hard blocker, not a
-    # reason to substitute current data.
     manifest = {
         "status": "research_started",
+        "research_version": RESEARCH_VERSION,
         "candidates": candidates,
         "portfolio_sizes": [5, 10, 20],
         "rebalance": ["quarterly", "semiannual", "annual"],
