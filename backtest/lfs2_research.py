@@ -36,6 +36,7 @@ def main() -> None:
             "no_ui_publication_until_validated",
         ],
     }
+    raise RuntimeError("BLOCKED: historical PIT value, momentum, and earnings-revision factor observations, forward-price cohort panel, and walk-forward evaluation are not implemented. Do not mark this workflow successful or publish a model.")
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / "lfs2_research_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
